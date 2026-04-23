@@ -15,3 +15,12 @@ scripts/electrode_cache.jsonl
 scripts/d99_electrode_cache.jsonl
 scripts/nmt_electrode_cache.jsonl
 scripts/mebrains_electrode_cache.jsonl
+scripts/*_electrode_cache.jsonl.bak
+
+# Playwright render diagnostics
+debug_output/
+
+# uv project scaffolding (kept out of the repo; callers use uv run --with)
+/pyproject.toml
+/uv.lock
+/.python-version

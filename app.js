@@ -2242,3 +2242,41 @@ init().catch(err => {
   console.error('Failed to initialize:', err);
   updateLoadingText(`Error: ${err.message}`);
 });
+
+// Debug hook (opt-in via ?debug=1). Exposes internal state to Playwright and
+// DevTools so rendering issues can be diagnosed without UI clicking.
+if (new URLSearchParams(window.location.search).get('debug') === '1') {
+  window.__debug = {
+    get scene() { return scene; },
+    get camera() { return camera; },
+    get controls() { return controls; },
+    get meshObjects() { return meshObjects; },
+    get meshManifest() { return meshManifest; },
+    get dandiRegions() { return dandiRegions; },
+    get activeAtlas() { return activeAtlas; },
+    get THREE() { return THREE; },
+    meshBounds(id) {
+      const m = meshObjects[id];
+      if (!m) return null;
+      const box = new THREE.Box3().setFromObject(m);
+      const c = box.getCenter(new THREE.Vector3());
+      return {
+        id,
+        visible: m.visible,
+        worldPosition: m.getWorldPosition(new THREE.Vector3()).toArray(),
+        boundsMin: box.min.toArray(),
+        boundsMax: box.max.toArray(),
+        center: c.toArray(),
+      };
+    },
+    cameraState() {
+      return {
+        position: camera.position.toArray(),
+        up: camera.up.toArray(),
+        target: controls ? controls.target.toArray() : null,
+        matrixWorld: camera.matrixWorld.elements,
+      };
+    },
+  };
+  console.log('[debug] window.__debug exposed');
+}

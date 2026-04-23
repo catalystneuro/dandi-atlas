@@ -61,7 +61,7 @@ ATLAS_CONFIGS = {
     "d99": {
         "nifti": TURNER_DATA / "d99_atlas/D99_v2.0_dist/D99_atlas_v2.0.nii.gz",
         "labels_type": "d99",
-        "hdf5_path": "general/localization/D99AtlasCoordinates",
+        "hdf5_path": "general/localization/D99v2AtlasCoordinates",
         "output_dir": PROJECT_ROOT / "data/atlases/d99",
         "cache_file": SCRIPTS_DIR / "d99_electrode_cache.jsonl",
         "root_name": "D99 Atlas",
@@ -69,7 +69,7 @@ ATLAS_CONFIGS = {
     "nmt": {
         "nifti": TURNER_DATA / "nmt_v2/NMT_v2.0_sym/NMT_v2.0_sym/supplemental_CHARM/CHARM_4_in_NMT_v2.0_sym.nii.gz",
         "labels_type": "charm",
-        "hdf5_path": "general/localization/NMTv2symAtlasCoordinates",
+        "hdf5_path": "general/localization/NMTv2AtlasCoordinates",
         "output_dir": PROJECT_ROOT / "data/atlases/nmt",
         "cache_file": SCRIPTS_DIR / "nmt_electrode_cache.jsonl",
         "root_name": "NMT v2.0 sym (CHARM)",
@@ -757,21 +757,32 @@ def generate_meshes(nifti_file, meshes_dir, id_to_structure, template_nifti=None
         if generated > 0 and generated % 50 == 0:
             print(f"  Generated {generated} meshes...")
 
-    # Generate parent meshes by merging child voxel masks
-    # Collect leaf label IDs for each synthetic parent node
+    # Generate parent meshes by merging descendant voxel masks.
+    # A node is a "leaf-in-volume" iff its ID appears in the NIfTI; everything
+    # else (synthetic D99 categories and native CHARM/MEBRAINS parents alike)
+    # needs a merged mesh from the union of its descendant leaves.
+    children_map = {}
+    for node_id, node in id_to_structure.items():
+        pid = node.get("parent_structure_id")
+        if pid is not None:
+            children_map.setdefault(pid, []).append(node_id)
+
     parent_to_leaves = {}
     for node_id, node in id_to_structure.items():
-        if node_id >= CATEGORY_ID_START or node_id in (ROOT_ID, OUTSIDE_ID):
+        if node_id in (ROOT_ID, OUTSIDE_ID):
             continue
-        # This is a leaf region (has a label in the volume)
-        parent_id = node.get("parent_structure_id")
-        while parent_id is not None and parent_id >= CATEGORY_ID_START:
-            if parent_id not in parent_to_leaves:
-                parent_to_leaves[parent_id] = []
-            parent_to_leaves[parent_id].append(node_id)
-            # Also add to grandparent
-            parent_node = id_to_structure.get(parent_id)
-            parent_id = parent_node.get("parent_structure_id") if parent_node else None
+        if node_id in unique_labels:
+            continue  # has own voxels, already handled by the per-region pass
+        # Collect leaf-in-volume descendants
+        stack = list(children_map.get(node_id, []))
+        leaves = []
+        while stack:
+            cid = stack.pop()
+            if cid in unique_labels:
+                leaves.append(cid)
+            stack.extend(children_map.get(cid, []))
+        if leaves:
+            parent_to_leaves[node_id] = leaves
 
     parent_generated = 0
     for parent_id, leaf_ids in sorted(parent_to_leaves.items()):
@@ -956,18 +967,36 @@ def _append_cache(cache_file, entry):
 
 
 def _map_regions_by_abbreviation(brain_region_ids, abbrev_to_id, id_to_structure):
-    """Map D99 abbreviations to structure graph regions."""
+    """Map brain_region_id values to structure graph regions.
+
+    Accepts mixed input types (str, bytes, int) and a small set of sentinels
+    (empty, None, "0", "outside" case-insensitive) which all map to OUTSIDE_ID.
+    De-duplicates repeat labels within a single call.
+    """
     regions = []
-    for abbrev in brain_region_ids:
-        if abbrev == "outside":
+    seen = set()
+    for raw in brain_region_ids:
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", errors="replace")
+        key = None if raw is None else str(raw).strip()
+        if not key or key == "0" or key.lower() == "outside":
+            if OUTSIDE_ID in seen:
+                continue
+            seen.add(OUTSIDE_ID)
             regions.append({
                 "id": OUTSIDE_ID,
                 "acronym": "outside",
                 "name": "Outside atlas",
             })
             continue
-        label_id = abbrev_to_id.get(abbrev)
-        if label_id is not None and label_id in id_to_structure:
+        label_id = abbrev_to_id.get(key)
+        if label_id is None:
+            try:
+                label_id = abbrev_to_id.get(str(int(key)))
+            except (TypeError, ValueError):
+                pass
+        if label_id is not None and label_id in id_to_structure and label_id not in seen:
+            seen.add(label_id)
             s = id_to_structure[label_id]
             regions.append({
                 "id": label_id,
@@ -1004,18 +1033,34 @@ def _map_regions_by_voxel(raw_coords, nifti_data, inv_affine, id_to_structure):
 
 def fetch_dandi_data(
     config, abbrev_to_id, id_to_structure, parent_map,
-    nifti_data=None, inv_affine=None,
 ):
     """Fetch electrode data from DANDI 001636 and build all output files.
 
-    For D99/NMT atlases, uses brain_region_id abbreviations for region mapping.
-    For MEBRAINS, uses voxel lookup (nifti_data + inv_affine must be provided).
+    Region mapping is abbreviation-primary: whatever the NWB stores in
+    brain_region_id wins. For MEBRAINS, voxel lookup against the parcellation
+    NIfTI is kept as a fallback for older files that don't populate
+    brain_region_id; it is loaded lazily only if the fallback fires.
     """
     hdf5_path = config["hdf5_path"]
     cache_file = config["cache_file"]
     data_dir = config["output_dir"]
     electrodes_dir = data_dir / "electrodes"
-    use_voxel_lookup = nifti_data is not None
+
+    voxel_fallback_enabled = config.get("labels_type") == "mebrains"
+    _voxel_state = {"loaded": False, "nifti_data": None, "inv_affine": None}
+
+    def _load_voxel_fallback():
+        if _voxel_state["loaded"]:
+            return _voxel_state["nifti_data"], _voxel_state["inv_affine"]
+        _voxel_state["loaded"] = True
+        if not voxel_fallback_enabled:
+            return None, None
+        import nibabel as nib
+        print("Loading parcellation NIfTI for voxel lookup fallback...")
+        img = nib.load(str(config["nifti"]))
+        _voxel_state["nifti_data"] = np.asarray(img.dataobj, dtype=np.int16)
+        _voxel_state["inv_affine"] = np.linalg.inv(img.affine)
+        return _voxel_state["nifti_data"], _voxel_state["inv_affine"]
 
     print(f"Fetching assets from dandiset {DANDISET_ID}...")
     assets = list(get_nwb_assets_paged(DANDISET_ID))
@@ -1088,15 +1133,21 @@ def fetch_dandi_data(
             skipped_no_loc += 1
             continue
 
-        # Map electrodes to regions
-        if use_voxel_lookup and result.get("raw_coords"):
-            regions = _map_regions_by_voxel(
-                result["raw_coords"], nifti_data, inv_affine, id_to_structure,
-            )
-        else:
+        # Map electrodes to regions. Abbreviation path is primary; voxel
+        # lookup is a fallback for older NWBs that don't populate
+        # brain_region_id (MEBRAINS only).
+        brain_ids = result.get("brain_region_id") or []
+        if brain_ids:
             regions = _map_regions_by_abbreviation(
-                result.get("brain_region_id", []), abbrev_to_id, id_to_structure,
+                brain_ids, abbrev_to_id, id_to_structure,
             )
+        elif voxel_fallback_enabled and result.get("raw_coords"):
+            nd, ia = _load_voxel_fallback()
+            regions = _map_regions_by_voxel(
+                result["raw_coords"], nd, ia, id_to_structure,
+            ) if nd is not None else []
+        else:
+            regions = []
 
         session = extract_session(path)
 
@@ -1190,24 +1241,24 @@ def main():
 
     # DANDI data
     if args.skip_dandi:
-        print("Skipping DANDI data extraction")
-        dandiset_assets = {DANDISET_ID: []}
-        dandisets_with_electrodes = []
-        dandi_regions = {}
+        print("Skipping DANDI data extraction; reusing existing JSON if present")
+        try:
+            with open(data_dir / "dandiset_assets.json") as f:
+                dandiset_assets = json.load(f)
+            with open(data_dir / "dandisets_with_electrodes.json") as f:
+                dandisets_with_electrodes = json.load(f)
+            with open(data_dir / "dandi_regions.json") as f:
+                dandi_regions = json.load(f)
+            asset_count = sum(len(v) for v in dandiset_assets.values())
+            print(f"  Reused {asset_count} asset entries, {len(dandi_regions)} regions")
+        except FileNotFoundError:
+            print("  No existing DANDI outputs to reuse; writing empty placeholders")
+            dandiset_assets = {DANDISET_ID: []}
+            dandisets_with_electrodes = []
+            dandi_regions = {}
     else:
-        # For MEBRAINS, load NIfTI for voxel-based region lookup
-        nifti_data = None
-        inv_affine = None
-        if config["labels_type"] == "mebrains":
-            import nibabel as nib
-            print("Loading MEBRAINS NIfTI for voxel lookup...")
-            img = nib.load(str(config["nifti"]))
-            nifti_data = np.asarray(img.dataobj, dtype=np.int16)
-            inv_affine = np.linalg.inv(img.affine)
-
         dandiset_assets, dandisets_with_electrodes, dandi_regions = fetch_dandi_data(
             config, abbrev_to_id, id_to_structure, parent_map,
-            nifti_data=nifti_data, inv_affine=inv_affine,
         )
 
     # Write outputs
