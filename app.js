@@ -54,7 +54,7 @@ const ATLAS_CONFIGS = {
     nearPlane: 0.1,
     farPlane: 1000,
     electrodeSize: 3,
-    rootOpacity: 0.06,
+    rootOpacity: 0.3,
     coordSystem: 'ras',
     attribution: 'Atlas: D99 v2 (Saleem & Logothetis)',
     attributionUrl: 'https://afni.nimh.nih.gov/pub/dist/doc/htmldoc/nonhuman/macaque_tempatl/atlas_d99v2.html',
@@ -69,7 +69,7 @@ const ATLAS_CONFIGS = {
     nearPlane: 0.1,
     farPlane: 1000,
     electrodeSize: 3,
-    rootOpacity: 0.06,
+    rootOpacity: 0.3,
     coordSystem: 'ras',
     attribution: 'Atlas: NMT v2 (Jung et al. 2021)',
     attributionUrl: 'https://afni.nimh.nih.gov/pub/dist/doc/htmldoc/nonhuman/macaque_tempatl/template_nmtv2.html',
@@ -84,7 +84,7 @@ const ATLAS_CONFIGS = {
     nearPlane: 0.1,
     farPlane: 1000,
     electrodeSize: 3,
-    rootOpacity: 0.015,
+    rootOpacity: 0.25,
     coordSystem: 'ras',
     attribution: 'Atlas: MEBRAINS (EBRAINS)',
     attributionUrl: 'https://ebrains.eu/tools/mebrains',
@@ -427,7 +427,7 @@ function loadMesh(structureId) {
             color: 0xcccccc,
             transparent: true,
             opacity: activeAtlas.rootOpacity,
-            side: THREE.DoubleSide,
+            side: THREE.FrontSide,
             depthWrite: false,
           });
         } else if (hasData) {
@@ -661,18 +661,35 @@ function applyDimmed(mesh) {
     mesh.visible = false;
     mesh.userData.isDimmed = true;
   } else {
-    // Macaque: neutral gray ghost for anatomical context
-    const orig = mesh.userData.originalMaterial;
-    if (orig) {
+    // Macaque visibility policy: hide every non-root mesh. Root becomes a
+    // translucent silhouette via the depthTest=false outline trick so users
+    // keep spatial orientation without paying the overdraw cost of 380+
+    // overlapping transparent context meshes.
+    //
+    // At dandiset selection, the Selected set is each dandiset data region's
+    // exact `brain_region_id` mesh — no hierarchy rollup. If a future
+    // dandiset annotates at mixed levels (e.g. some sessions at M1, some at
+    // motor_cortex), a descendant could be visually hidden inside an opaque
+    // ancestor. Revisit the policy when that happens. See
+    // obsidian_docs/3d_visualization/atlas_visibility_and_opacity_policy.md
+    if (mesh.userData.isRoot) {
+      const orig = mesh.userData.originalMaterial;
       const mat = orig.clone();
-      mat.color.set(0x888888);
-      mat.opacity = Math.min(orig.opacity, 0.08) * regionAlpha;
+      mat.opacity = 0.15;
       mat.transparent = true;
+      mat.depthTest = false;
       mat.depthWrite = false;
+      // Outline mode needs DoubleSide so the far wall of the brain is visible
+      // through the translucent near wall. FrontSide (used for the solid root
+      // at init) culls back faces and makes the outline look like a half-shell.
+      mat.side = THREE.DoubleSide;
       mat.needsUpdate = true;
       mesh.material = mat;
+      mesh.renderOrder = -1;
+      mesh.visible = true;
+    } else {
+      mesh.visible = false;
     }
-    mesh.visible = true;
     mesh.userData.isDimmed = true;
   }
 }
@@ -692,10 +709,14 @@ function applyActive(mesh) {
   const orig = mesh.userData.originalMaterial;
   const mat = orig.clone();
   if (mesh.userData.isRoot && activeAtlas.coordSystem !== 'allen') {
-    // Macaque: root mesh keeps its configured low opacity even when "active"
-    mat.opacity = orig.opacity * regionAlpha;
-    mat.transparent = true;
-    mat.depthWrite = false;
+    // Macaque: when root is THE active mesh (init view, no selection), render
+    // it as a solid brain shape at full alpha. Reset any outline-mode flags
+    // that applyDimmed may have set previously.
+    mat.opacity = regionAlpha;
+    mat.transparent = regionAlpha < 1;
+    mat.depthWrite = regionAlpha >= 1;
+    mat.depthTest = true;
+    mesh.renderOrder = 0;
   } else {
     mat.opacity = regionAlpha;
     mat.transparent = regionAlpha < 1;

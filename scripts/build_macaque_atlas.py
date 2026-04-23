@@ -23,14 +23,19 @@ Usage:
 
 import argparse
 import csv
+import hashlib
 import io
 import json
+import re
 import sys
 import time
+import urllib.error
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import numpy as np
+from scipy.ndimage import gaussian_filter
 
 from dandi_helpers import (
     get_nwb_assets_paged,
@@ -55,16 +60,64 @@ TURNER_DATA = Path(
 D99_LABELS_FILE = TURNER_DATA / "d99_atlas/D99_v2.0_dist/D99_v2.0_labels_semicolon.txt"
 NMT_LABELS_FILE = TURNER_DATA / "nmt_v2/NMT_v2.0_sym/tables_D99/D99_labeltable.txt"
 CHARM_LABELS_FILE = TURNER_DATA / "nmt_v2/NMT_v2.0_sym/tables_CHARM/CHARM_key_all.txt"
+CHARM_PALETTE_FILE = TURNER_DATA / "nmt_v2/NMT_v2.0_sym/tables_CHARM/hue_CHARM_cmap.pal"
 MEBRAINS_LABELS_FILE = TURNER_DATA / "mebrains/MEBRAINS_labels.json"
+
+# Siibra (Scalable Infrastructure for Integration of Brain Atlas Research
+# Architectures, Forschungszentrum Jülich) provides the de-facto MEBRAINS
+# colour palette across the EBRAINS ecosystem. We fetch the parcellation tree
+# and the labelled-map indices from their configuration repo, join on
+# region-name, and cache the resulting {label_id: "RRGGBB"} dict locally so
+# subsequent builds don't re-hit the network.
+SIIBRA_MEBRAINS_PARCELLATION_URL = (
+    "https://raw.githubusercontent.com/FZJ-INM1-BDA/siibra-configurations/"
+    "master/parcellations/mebrains_parcellation.json"
+)
+SIIBRA_MEBRAINS_LABELLED_MAP_URL = (
+    "https://raw.githubusercontent.com/FZJ-INM1-BDA/siibra-configurations/"
+    "master/maps/monkey-mebrains-labelled.json"
+)
+SIIBRA_MEBRAINS_PALETTE_CACHE = SCRIPTS_DIR / "siibra_mebrains_palette.json"
+
+# MEBRAINS hand-curated pial surfaces (FreeSurfer) hosted on the EBRAINS
+# public data-proxy. Prefer these over marching cubes on the T1 template for
+# the root outline: the pials are watertight hemispheres (~100k verts each)
+# with clean sulcal geometry, while MC-on-T1 picks up noise and imaging
+# artefacts. Cached locally after first download.
+MEBRAINS_PIAL_BUCKET = (
+    "https://data-proxy.ebrains.eu/api/v1/buckets/"
+    "d-9414c255-ba26-4b4b-ae0b-7e0a48140b0c"
+)
+# Objects live under v1.0/MEBRAINS_surface_templates/. redirect=true makes the
+# data-proxy redirect to the signed CSCS Ceph URL in one request.
+MEBRAINS_PIAL_LH_URL = (
+    f"{MEBRAINS_PIAL_BUCKET}/v1.0/MEBRAINS_surface_templates/"
+    f"lh.MEBRAINS.pial.gii?redirect=true"
+)
+MEBRAINS_PIAL_RH_URL = (
+    f"{MEBRAINS_PIAL_BUCKET}/v1.0/MEBRAINS_surface_templates/"
+    f"rh.MEBRAINS.pial.gii?redirect=true"
+)
+MEBRAINS_PIAL_LH_CACHE = SCRIPTS_DIR / "mebrains_pial_lh.gii"
+MEBRAINS_PIAL_RH_CACHE = SCRIPTS_DIR / "mebrains_pial_rh.gii"
 
 ATLAS_CONFIGS = {
     "d99": {
         "nifti": TURNER_DATA / "d99_atlas/D99_v2.0_dist/D99_atlas_v2.0.nii.gz",
+        "template_nifti": TURNER_DATA / "d99_atlas/D99_v2.0_dist/D99_template.nii.gz",
         "labels_type": "d99",
         "hdf5_path": "general/localization/D99v2AtlasCoordinates",
         "output_dir": PROJECT_ROOT / "data/atlases/d99",
         "cache_file": SCRIPTS_DIR / "d99_electrode_cache.jsonl",
         "root_name": "D99 Atlas",
+        # D99 ships only right-hemisphere per-region surfaces. We mirror each
+        # surface along X to synthesise a bilateral mesh, matching the
+        # bilateral parcellation volume.
+        "gifti_surfaces": {
+            "surfaces_dir": TURNER_DATA / "d99_atlas/D99_v2.0_dist/surfs_right",
+            "filename_pattern": re.compile(r"\.k(\d+)\.gii$"),
+            "mirror_hemisphere": True,
+        },
     },
     "nmt": {
         "nifti": TURNER_DATA / "nmt_v2/NMT_v2.0_sym/NMT_v2.0_sym/supplemental_CHARM/CHARM_4_in_NMT_v2.0_sym.nii.gz",
@@ -73,6 +126,16 @@ ATLAS_CONFIGS = {
         "output_dir": PROJECT_ROOT / "data/atlases/nmt",
         "cache_file": SCRIPTS_DIR / "nmt_electrode_cache.jsonl",
         "root_name": "NMT v2.0 sym (CHARM)",
+        # CHARM ships per-region surfaces per hierarchy level. Each per-region
+        # surface is already bilateral (symmetric about X=0), so no mirroring
+        # is needed. Whole-brain root uses lh+rh gray-surface union.
+        "gifti_surfaces": {
+            "charm_levels_dir": TURNER_DATA / "nmt_v2/NMT_v2.0_sym/NMT_v2.0_sym_surfaces/atlases/CHARM",
+            "whole_brain_lh": TURNER_DATA / "nmt_v2/NMT_v2.0_sym/NMT_v2.0_sym_surfaces/lh.gray_surface.rsl.gii",
+            "whole_brain_rh": TURNER_DATA / "nmt_v2/NMT_v2.0_sym/NMT_v2.0_sym_surfaces/rh.gray_surface.rsl.gii",
+            "filename_pattern": re.compile(r"\.k(\d+)\.gii$"),
+            "mirror_hemisphere": False,
+        },
     },
     "mebrains": {
         "nifti": TURNER_DATA / "mebrains/MEBRAINS_parcellation.nii.gz",
@@ -99,6 +162,18 @@ OUTSIDE_ID = 9998
 CATEGORY_ID_START = 10001
 SUBCATEGORY_ID_START = 10100
 TARGET_FACES = 10_000
+# Root (whole-brain outline) gets a higher face cap so surface detail shows.
+# Region meshes stay at TARGET_FACES since they're smaller and overlap with each other.
+# Root is rendered transparent + DoubleSide, so keep this modest — each face costs
+# 2x to draw and enters the transparent-queue sort path.
+ROOT_TARGET_FACES = 50_000
+# GIFTI surfaces ship with their own smooth, well-balanced triangulation
+# (median dihedral ≈ 0°, mean ≈ 10°). Aggressive quadric decimation destroys
+# this quality — pushing the mean above 25°. We keep the GIFTI target much
+# higher so most per-region meshes pass through unchanged; only truly huge
+# surfaces (e.g. CHARM level 1 lobes with ~250k triangles) get decimated.
+TARGET_FACES_GIFTI = 20_000
+ROOT_TARGET_FACES_GIFTI = 60_000
 MIN_VOXELS = 50
 
 # Category color hues (HSL hue in degrees), covering both D99 and MEBRAINS
@@ -125,6 +200,27 @@ CATEGORY_HUES = {
     "White matter": 150,
     "Ventricle": 200,
     "Other": 150,
+}
+
+
+# D5a, per-category hue ranges for D99 (hue_centre, hue_width in degrees).
+# Each region within a category gets a specific hue from hash(abbrev) within
+# the (centre - width/2, centre + width/2) arc. Fixed saturation 0.6, lightness 0.45.
+# Chosen to differ from Allen CCF's conventions so D99 reads as a standalone
+# macaque atlas. See obsidian_docs/3d_visualization/macaque_color_policy.md.
+D99_CATEGORY_RANGES = {
+    "Cortex":                           (220, 60),   # blue family
+    "Basal ganglia":                    (20,  40),   # warm red-orange
+    "Thalamus":                         (320, 40),   # magenta-pink
+    "Brainstem":                        (60,  40),   # olive-yellow
+    "Cerebellum":                       (150, 40),   # teal-green
+    "Hypothalamus":                     (95,  30),   # yellow-green
+    "Hippocampus":                      (275, 30),   # violet
+    "Amygdala":                         (0,   20),   # red
+    "Basal forebrain":                  (180, 30),   # cyan
+    "Fiber bundle":                     (45,  20),   # ochre
+    "Bed nucleus of stria terminalis":  (340, 15),   # pink
+    "Other":                            (100, 30),   # yellow-green fallback
 }
 
 
@@ -300,13 +396,25 @@ def parse_charm_labels():
             full_name = parts[2].replace("_", " ")
             first_level = int(parts[3])
 
-            # Parent is the most recent entry at the level above
+            # Parent is the most recent ancestor at any level strictly less
+            # than first_level. CHARM can skip levels (e.g. level 3 -> level 5),
+            # so we must walk up from first_level - 1 until we find one.
             if first_level == 1:
                 parent_index = None
             else:
-                parent_index = ancestors.get(first_level - 1)
+                parent_index = None
+                for ancestor_level in range(first_level - 1, 0, -1):
+                    if ancestor_level in ancestors:
+                        parent_index = ancestors[ancestor_level]
+                        break
 
             ancestors[first_level] = index
+            # Clear any stale deeper-level entries. A new entry at first_level
+            # resets the context below it, so prior entries at deeper levels
+            # (from a different branch) must not become false ancestors.
+            for ancestor_level in list(ancestors):
+                if ancestor_level > first_level:
+                    del ancestors[ancestor_level]
 
             entries.append({
                 "index": index,
@@ -317,6 +425,140 @@ def parse_charm_labels():
             })
 
     return entries
+
+
+def load_charm_palette():
+    """Load the official CHARM colour palette shipped with NMT v2.0-sym.
+
+    The file is a simple list of hex colours (one per line) with a text
+    header on the first line. Line N+1 corresponds to CHARM label index N,
+    so the palette maps 1-based label indices to hex colour strings.
+
+    Returns dict {label_index: "rrggbb"} with no leading '#', matching the
+    `color_hex_triplet` format used elsewhere in the script.
+    """
+    palette = {}
+    with open(CHARM_PALETTE_FILE) as f:
+        next(f)  # skip header line (e.g. "Hue_CHARM_v1.3")
+        for label_index, line in enumerate(f, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            hex_code = line.lstrip("#").upper()
+            palette[label_index] = hex_code
+    return palette
+
+
+def _walk_siibra_regions(node, out):
+    """Recursively collect (name, rgb) pairs from a siibra parcellation tree.
+
+    The tree uses a mix of dicts and lists. A dict that carries both "name"
+    and "rgb" is a recordable region; we also recurse into any list values
+    and any dict values to keep walking deeper. Lists are traversed element
+    by element.
+    """
+    if isinstance(node, dict):
+        name = node.get("name")
+        rgb = node.get("rgb")
+        if isinstance(name, str) and isinstance(rgb, str):
+            out.append((name, rgb))
+        for value in node.values():
+            if isinstance(value, (dict, list)):
+                _walk_siibra_regions(value, out)
+    elif isinstance(node, list):
+        for item in node:
+            _walk_siibra_regions(item, out)
+
+
+def load_mebrains_palette_from_siibra():
+    """Fetch (or load cached) MEBRAINS region colours from siibra-configurations.
+
+    Joins the parcellation region tree with the labelled-map `indices` dict by
+    region-name to produce {label_id: "RRGGBB"} (no '#' prefix, uppercased to
+    match the `color_hex_triplet` format used elsewhere in this script).
+
+    Caches the resulting dict at SIIBRA_MEBRAINS_PALETTE_CACHE so subsequent
+    builds skip the network fetch. Returns an empty dict on network failure
+    when no cache is available, so the caller can fall back to fabricated
+    colours without crashing.
+    """
+    if SIIBRA_MEBRAINS_PALETTE_CACHE.exists():
+        with open(SIIBRA_MEBRAINS_PALETTE_CACHE) as f:
+            palette = json.load(f)
+        # JSON object keys are strings; normalise to int label IDs.
+        palette = {int(k): v for k, v in palette.items()}
+        print(
+            f"  Loaded MEBRAINS palette from cache "
+            f"({len(palette)} entries, {SIIBRA_MEBRAINS_PALETTE_CACHE.name})"
+        )
+        return palette
+
+    try:
+        with urllib.request.urlopen(SIIBRA_MEBRAINS_PARCELLATION_URL) as response:
+            parcellation = json.loads(response.read().decode("utf-8"))
+        with urllib.request.urlopen(SIIBRA_MEBRAINS_LABELLED_MAP_URL) as response:
+            labelled_map = json.loads(response.read().decode("utf-8"))
+    except (urllib.error.URLError, urllib.error.HTTPError, OSError) as exc:
+        print(
+            f"  WARNING: Could not fetch siibra MEBRAINS palette ({exc}); "
+            f"falling back to fabricated colours."
+        )
+        return {}
+
+    name_to_rgb = {}
+    pairs = []
+    _walk_siibra_regions(parcellation, pairs)
+    for name, rgb in pairs:
+        name_to_rgb[name] = rgb.lstrip("#").upper()
+
+    indices = labelled_map.get("indices", {})
+    palette = {}
+    for region_name, entries in indices.items():
+        rgb = name_to_rgb.get(region_name)
+        if rgb is None:
+            continue
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            label = entry.get("label")
+            if label is None:
+                continue
+            palette[int(label)] = rgb
+
+    # Persist cache (keys as strings per JSON convention).
+    with open(SIIBRA_MEBRAINS_PALETTE_CACHE, "w") as f:
+        json.dump({str(k): v for k, v in palette.items()}, f, indent=2, sort_keys=True)
+    print(
+        f"  Fetched MEBRAINS palette from siibra "
+        f"({len(palette)} entries, cached to {SIIBRA_MEBRAINS_PALETTE_CACHE.name})"
+    )
+    return palette
+
+
+def ensure_mebrains_pial_cache():
+    """Download the MEBRAINS lh/rh pial GIFTIs to the scripts cache if absent.
+
+    Returns a tuple (lh_path, rh_path) pointing to local cached files, or
+    (None, None) if either download failed (caller should fall back to the
+    marching-cubes path on the T1 template).
+    """
+    targets = [
+        (MEBRAINS_PIAL_LH_URL, MEBRAINS_PIAL_LH_CACHE),
+        (MEBRAINS_PIAL_RH_URL, MEBRAINS_PIAL_RH_CACHE),
+    ]
+    for url, dest in targets:
+        if dest.exists() and dest.stat().st_size > 0:
+            continue
+        print(f"  Fetching {dest.name} from EBRAINS data-proxy...")
+        try:
+            with urllib.request.urlopen(url) as response:
+                data = response.read()
+            dest.write_bytes(data)
+            print(f"    Cached {len(data):,} bytes to {dest}")
+        except (urllib.error.URLError, urllib.error.HTTPError, OSError) as exc:
+            print(f"    WARNING: could not fetch {url}: {exc}")
+            return None, None
+    return MEBRAINS_PIAL_LH_CACHE, MEBRAINS_PIAL_RH_CACHE
 
 
 def build_charm_structure_graph(entries, root_name="NMT v2.0 sym (CHARM)"):
@@ -330,6 +572,10 @@ def build_charm_structure_graph(entries, root_name="NMT v2.0 sym (CHARM)"):
     id_to_structure = {}
     parent_map = {}
     abbrev_to_id = {}
+
+    # Official CHARM colour palette, keyed by label index. Shipped with the
+    # NMT v2.0-sym distribution as tables_CHARM/hue_CHARM_cmap.pal.
+    charm_palette = load_charm_palette()
 
     root = {
         "id": ROOT_ID,
@@ -353,36 +599,21 @@ def build_charm_structure_graph(entries, root_name="NMT v2.0 sym (CHARM)"):
     id_to_structure[OUTSIDE_ID] = outside_node
     parent_map[OUTSIDE_ID] = ROOT_ID
 
-    # Assign colors based on level 1 lobe
-    lobe_hues = {
-        "Frontal": 210,
-        "Parietal": 60,
-        "Temporal": 180,
-        "Occipital": 120,
-    }
-
-    # First pass: find which lobe each entry belongs to
-    entry_lobe = {}
-    current_lobe = None
-    for entry in entries:
-        if entry["level"] == 1:
-            current_lobe = entry["abbreviation"]
-        entry_lobe[entry["index"]] = current_lobe
-
     for entry in entries:
         label_id = entry["index"]
         parent_index = entry["parent_index"]
         parent_id = parent_index if parent_index is not None else ROOT_ID
 
-        lobe = entry_lobe.get(label_id, "Frontal")
-        hue = lobe_hues.get(lobe, 150)
-        lightness = 0.3 + 0.1 * entry["level"]
+        # Use the official CHARM colour. Fall back to a neutral grey if the
+        # palette is missing an entry for this label (shouldn't happen with
+        # the shipped palette, which covers all 247 CHARM labels).
+        color = charm_palette.get(label_id, "AAAAAA")
 
         node = {
             "id": label_id,
             "acronym": entry["abbreviation"],
             "name": entry["name"],
-            "color_hex_triplet": _hsl_to_hex(hue, 0.6, lightness),
+            "color_hex_triplet": color,
             "parent_structure_id": parent_id,
             "children": [],
         }
@@ -514,8 +745,28 @@ def _hsl_to_hex(h, s, l):
     return f"{r:02X}{g:02X}{b:02X}"
 
 
-def build_structure_graph(entries, root_name="D99 Atlas"):
+def _d99_color_for(abbreviation, category):
+    """D5a: per-region hue hashed within the category's hue range."""
+    centre, width = D99_CATEGORY_RANGES.get(category, D99_CATEGORY_RANGES["Other"])
+    h = hashlib.md5(abbreviation.encode("utf-8")).hexdigest()[:8]
+    frac = int(h, 16) / 0xFFFFFFFF
+    hue = (centre - width / 2 + frac * width) % 360
+    return _hsl_to_hex(hue, 0.6, 0.45)
+
+
+def build_structure_graph(entries, root_name="D99 Atlas", color_overrides=None, labels_type=None):
     """Build a hierarchical structure graph from parsed label entries.
+
+    If `color_overrides` is provided, it should be a dict {label_index:
+    "RRGGBB"} supplying authoritative colours for specific regions (e.g. the
+    siibra palette for MEBRAINS). Any entry whose index is present there uses
+    that colour verbatim.
+
+    When `labels_type == "d99"`, leaf region colours are generated via the D5a
+    scheme (per-region hue hashed within each category's hue range in
+    `D99_CATEGORY_RANGES`, fixed S=0.6 L=0.45). Otherwise, leaf colours fall
+    back to the legacy per-index-within-category HSL formula keyed off
+    CATEGORY_HUES.
 
     Returns (tree_root, id_to_structure, parent_map, abbrev_to_id).
     """
@@ -531,10 +782,17 @@ def build_structure_graph(entries, root_name="D99 Atlas"):
         cat = entry["category"]
         current = category_index.get(cat, 0)
         category_index[cat] = current + 1
-        hue = CATEGORY_HUES.get(cat, 150)
-        total = category_counts[cat]
-        lightness = 0.35 + 0.4 * (current / max(total - 1, 1))
-        entry_colors[entry["index"]] = _hsl_to_hex(hue, 0.6, lightness)
+        if color_overrides is not None and entry["index"] in color_overrides:
+            entry_colors[entry["index"]] = color_overrides[entry["index"]]
+        elif labels_type == "d99":
+            entry_colors[entry["index"]] = _d99_color_for(
+                entry["abbreviation"], cat
+            )
+        else:
+            hue = CATEGORY_HUES.get(cat, 150)
+            total = category_counts[cat]
+            lightness = 0.35 + 0.4 * (current / max(total - 1, 1))
+            entry_colors[entry["index"]] = _hsl_to_hex(hue, 0.6, lightness)
 
     # Collect unique categories and subcategories
     categories = {}
@@ -666,13 +924,60 @@ def build_structure_graph(entries, root_name="D99 Atlas"):
 # ---------------------------------------------------------------------------
 
 
-def generate_meshes(nifti_file, meshes_dir, id_to_structure, template_nifti=None):
+def _export_template_root_glb(template_nifti, root_glb, target_faces, level=50.0):
+    """Generate a root (whole-brain) mesh by marching cubes on a T1 template.
+
+    Shared by both the pure-NIfTI path (MEBRAINS fallback) and the GIFTI path
+    (D99, which has no upstream whole-brain surface). The template is treated
+    as a continuous intensity field pre-smoothed with a gaussian, matching the
+    per-region MC smoothing so the root blends visually with other outlines.
+    After marching cubes we keep only the largest connected component: T1
+    templates often contain small disjoint voxel islands (dura remnants,
+    ventricle edges) that push the Euler number up by hundreds without
+    contributing to the visible brain outline. Standard world-space x-flip +
+    vertex-normal caching are applied.
+
+    Returns the exported trimesh.Trimesh (or None if extraction failed).
+    """
+    import nibabel as nib
+    from skimage.measure import marching_cubes
+    import trimesh
+
+    t1_img = nib.load(str(template_nifti))
+    t1_data = np.asarray(t1_img.dataobj, dtype=np.float32)
+    t1_affine = t1_img.affine
+    # Gaussian pre-smooth matches per-region MC blur (sigma=1.0) so the
+    # isosurface is smoother than raw marching cubes on noisy MRI data.
+    t1_smooth = gaussian_filter(t1_data, sigma=1.0)
+    verts, faces, _, _ = marching_cubes(t1_smooth, level=level)
+    verts_homogeneous = np.column_stack([verts, np.ones(len(verts))])
+    verts_world = (t1_affine @ verts_homogeneous.T).T[:, :3]
+    verts_world[:, 0] *= -1
+    faces = faces[:, ::-1]
+    mesh = trimesh.Trimesh(vertices=verts_world, faces=faces)
+    # Keep only the largest connected component to drop template noise.
+    components = mesh.split(only_watertight=False)
+    if len(components) > 1:
+        components.sort(key=lambda c: len(c.faces), reverse=True)
+        mesh = components[0]
+    if len(mesh.faces) > target_faces:
+        mesh = mesh.simplify_quadric_decimation(face_count=target_faces)
+    _ = mesh.vertex_normals  # bake normals for GLB export
+    mesh.export(str(root_glb), file_type="glb")
+    return mesh
+
+
+def generate_meshes(
+    nifti_file, meshes_dir, id_to_structure, template_nifti=None,
+    root_pial_surfaces=None,
+):
     """Generate GLB meshes from a NIfTI atlas volume.
 
-    If template_nifti is provided, the root mesh is generated from the
-    template (thresholded MRI) instead of the parcellation. This produces a
-    complete brain outline even when the parcellation only covers part of the
-    volume (e.g. MEBRAINS cortical-only parcellation).
+    If root_pial_surfaces is provided (a list of GIFTI Paths), the root mesh
+    is built from their union, matching the MEBRAINS case where hand-curated
+    FreeSurfer pial hemispheres are higher quality than marching cubes on the
+    T1 template. Falls back to template_nifti (MC on T1) if pials are
+    unavailable, or to the parcellation union as a last resort.
 
     Returns list of label IDs that have no mesh.
     """
@@ -697,31 +1002,56 @@ def generate_meshes(nifti_file, meshes_dir, id_to_structure, template_nifti=None
     # Root mesh (whole brain outline)
     root_glb = meshes_dir / f"{ROOT_ID}.glb"
     if not root_glb.exists():
-        if template_nifti:
-            # Use T1 template for a complete brain surface
+        if root_pial_surfaces:
+            # Prefer upstream pial surfaces (e.g. MEBRAINS FreeSurfer pials).
+            # These are watertight per-hemisphere meshes, already smooth, so
+            # we only concatenate + decimate to the GIFTI root face cap.
+            names = ", ".join(Path(p).name for p in root_pial_surfaces)
+            print(f"Generating root mesh from pial surfaces: {names}")
+            mesh = _export_merged_gifti_glb(
+                root_glb, root_pial_surfaces, mirror=False,
+                target_faces=ROOT_TARGET_FACES_GIFTI,
+            )
+            if mesh is not None:
+                print(f"  Root mesh: {len(mesh.faces)} faces")
+                generated += 1
+            else:
+                print("  WARNING: pial surface load failed; falling back to T1 template")
+                if template_nifti:
+                    mesh = _export_template_root_glb(
+                        template_nifti, root_glb, ROOT_TARGET_FACES,
+                    )
+                    print(f"  Root mesh: {len(mesh.faces)} faces")
+                    generated += 1
+        elif template_nifti:
+            # Use T1 template for a complete brain surface.
             print(f"Generating root mesh from template: {template_nifti.name}")
-            t1_img = nib.load(str(template_nifti))
-            t1_data = np.asarray(t1_img.dataobj, dtype=np.float32)
-            t1_affine = t1_img.affine
-            root_mask = t1_data > 50  # threshold to get brain mask
-            root_affine = t1_affine
+            mesh = _export_template_root_glb(
+                template_nifti, root_glb, ROOT_TARGET_FACES,
+            )
+            print(f"  Root mesh: {len(mesh.faces)} faces")
+            generated += 1
         else:
-            # Use parcellation (union of all labeled voxels)
+            # Use parcellation (union of all labeled voxels). Pre-blur the
+            # binary mask so marching_cubes produces smoother surfaces.
             print("Generating root mesh (whole brain)...")
             root_mask = atlas_data > 0
-            root_affine = affine
-
-        verts, faces, _, _ = marching_cubes(root_mask, level=0.5)
-        verts_homogeneous = np.column_stack([verts, np.ones(len(verts))])
-        verts_world = (root_affine @ verts_homogeneous.T).T[:, :3]
-        verts_world[:, 0] *= -1
-        faces = faces[:, ::-1]
-        mesh = trimesh.Trimesh(vertices=verts_world, faces=faces)
-        if len(mesh.faces) > TARGET_FACES:
-            mesh = mesh.simplify_quadric_decimation(face_count=TARGET_FACES)
-        mesh.export(str(root_glb), file_type="glb")
-        print(f"  Root mesh: {len(mesh.faces)} faces")
-        generated += 1
+            root_field = gaussian_filter(root_mask.astype(float), sigma=1.0)
+            if root_field.max() <= 0.5:
+                root_field = root_mask.astype(float)
+            root_level = 0.5
+            verts, faces, _, _ = marching_cubes(root_field, level=root_level)
+            verts_homogeneous = np.column_stack([verts, np.ones(len(verts))])
+            verts_world = (affine @ verts_homogeneous.T).T[:, :3]
+            verts_world[:, 0] *= -1
+            faces = faces[:, ::-1]
+            mesh = trimesh.Trimesh(vertices=verts_world, faces=faces)
+            if len(mesh.faces) > ROOT_TARGET_FACES:
+                mesh = mesh.simplify_quadric_decimation(face_count=ROOT_TARGET_FACES)
+            _ = mesh.vertex_normals  # force trimesh to compute and cache normals so GLB export includes NORMAL attribute
+            mesh.export(str(root_glb), file_type="glb")
+            print(f"  Root mesh: {len(mesh.faces)} faces")
+            generated += 1
     else:
         skipped_existing += 1
 
@@ -740,7 +1070,13 @@ def generate_meshes(nifti_file, meshes_dir, id_to_structure, template_nifti=None
             continue
 
         try:
-            verts, faces, _, _ = marching_cubes(mask, level=0.5)
+            mask_smooth = gaussian_filter(mask.astype(float), sigma=1.0)
+            # For very small or thin regions the blur can push the peak below
+            # 0.5, which would leave level=0.5 outside the data range. Fall
+            # back to the raw binary mask in that case so we still emit a mesh.
+            if mask_smooth.max() <= 0.5:
+                mask_smooth = mask.astype(float)
+            verts, faces, _, _ = marching_cubes(mask_smooth, level=0.5)
             verts_homogeneous = np.column_stack([verts, np.ones(len(verts))])
             verts_world = (affine @ verts_homogeneous.T).T[:, :3]
             verts_world[:, 0] *= -1
@@ -748,6 +1084,7 @@ def generate_meshes(nifti_file, meshes_dir, id_to_structure, template_nifti=None
             mesh = trimesh.Trimesh(vertices=verts_world, faces=faces)
             if len(mesh.faces) > TARGET_FACES:
                 mesh = mesh.simplify_quadric_decimation(face_count=TARGET_FACES)
+            _ = mesh.vertex_normals  # force trimesh to compute and cache normals so GLB export includes NORMAL attribute
             mesh.export(str(glb_path), file_type="glb")
             generated += 1
         except Exception as exc:
@@ -803,7 +1140,12 @@ def generate_meshes(nifti_file, meshes_dir, id_to_structure, template_nifti=None
             continue
 
         try:
-            verts, faces, _, _ = marching_cubes(merged_mask, level=0.5)
+            merged_smooth = gaussian_filter(merged_mask.astype(float), sigma=1.0)
+            # Guard against very thin/sparse merged masks whose peak drops
+            # below 0.5 after blurring (would fail marching_cubes).
+            if merged_smooth.max() <= 0.5:
+                merged_smooth = merged_mask.astype(float)
+            verts, faces, _, _ = marching_cubes(merged_smooth, level=0.5)
             verts_homogeneous = np.column_stack([verts, np.ones(len(verts))])
             verts_world = (affine @ verts_homogeneous.T).T[:, :3]
             verts_world[:, 0] *= -1
@@ -811,6 +1153,7 @@ def generate_meshes(nifti_file, meshes_dir, id_to_structure, template_nifti=None
             mesh = trimesh.Trimesh(vertices=verts_world, faces=faces)
             if len(mesh.faces) > TARGET_FACES:
                 mesh = mesh.simplify_quadric_decimation(face_count=TARGET_FACES)
+            _ = mesh.vertex_normals  # force trimesh to compute and cache normals so GLB export includes NORMAL attribute
             mesh.export(str(glb_path), file_type="glb")
             parent_generated += 1
         except Exception as exc:
@@ -831,6 +1174,435 @@ def generate_meshes(nifti_file, meshes_dir, id_to_structure, template_nifti=None
         f"Meshes: {generated} leaf + {parent_generated} parent generated, "
         f"{skipped_existing} existing, {skipped_small} too small, "
         f"{len(no_mesh)} no mesh"
+    )
+    return sorted(set(no_mesh))
+
+
+# ---------------------------------------------------------------------------
+# Mesh generation from upstream GIFTI surfaces
+# ---------------------------------------------------------------------------
+
+
+def load_gifti_mesh(gii_path):
+    """Load a GIFTI surface and return (vertices, faces) as numpy arrays.
+
+    GIFTI surfaces have POINTSET (vertices) and TRIANGLE (faces) darrays.
+    Returns vertices shape (N, 3) float32, faces shape (M, 3) int32.
+    """
+    import nibabel as nib
+    g = nib.load(str(gii_path))
+    verts = None
+    faces = None
+    for darray in g.darrays:
+        intent = darray.intent
+        if intent == "NIFTI_INTENT_POINTSET" or getattr(darray, "intent", None) == 1008:
+            verts = darray.data
+        elif intent == "NIFTI_INTENT_TRIANGLE" or getattr(darray, "intent", None) == 1009:
+            faces = darray.data
+    if verts is None or faces is None:
+        raise ValueError(f"Could not find POINTSET+TRIANGLE in {gii_path}")
+    return verts.astype("float32"), faces.astype("int32")
+
+
+def _apply_world_flip(verts):
+    """Apply the same x-flip the marching-cubes path applies.
+
+    GIFTI surfaces ship in the native atlas frame (RAS for D99/NMT). The viewer
+    expects coordinates in the "x-flipped" space that the MC pipeline produces
+    (verts[:, 0] *= -1 after affine transform). Applying the same flip here
+    keeps GIFTI-derived meshes aligned with the electrode coordinates (which
+    are also flipped in extract_atlas_coords via `round(-xi, 3)`).
+    """
+    out = verts.copy()
+    out[:, 0] *= -1
+    return out
+
+
+def _mirror_mesh_x(verts, faces):
+    """Mirror a mesh across X=0 and flip face winding to preserve front-facing
+    normals.
+
+    Returns (mirrored_verts, mirrored_faces) with the same shapes as input.
+    """
+    mirrored_verts = verts.copy()
+    mirrored_verts[:, 0] *= -1
+    mirrored_faces = faces[:, ::-1].copy()
+    return mirrored_verts, mirrored_faces
+
+
+def _build_trimesh_from_arrays(verts, faces, *, merge_duplicates=False):
+    """Construct a trimesh.Trimesh from vertex/face arrays, apply the world
+    flip, force-cache vertex normals, and return the mesh.
+
+    The x-flip also requires flipping face winding so that front faces stay
+    front-facing (mirror inversion reverses triangle orientation).
+
+    When merging several surfaces (e.g. D99 root from 730 pieces), set
+    merge_duplicates=True to weld coincident vertices so adjacency information
+    is continuous. That helps quadric decimation behave sensibly and yields
+    smoother dihedral distributions. For single-region meshes this is a
+    no-op since the upstream triangulation is already welded.
+    """
+    import trimesh
+    flipped_verts = _apply_world_flip(verts)
+    flipped_faces = faces[:, ::-1].copy()
+    mesh = trimesh.Trimesh(
+        vertices=flipped_verts, faces=flipped_faces,
+        process=merge_duplicates,
+    )
+    _ = mesh.vertex_normals  # force trimesh to compute and cache normals
+    return mesh
+
+
+def _find_charm_surface(charm_levels_dir, level, label_id, pattern):
+    """Find the surface file for a CHARM label at a specific level.
+
+    Returns the Path if found, None otherwise.
+    """
+    level_dir = Path(charm_levels_dir) / f"Level_{level}"
+    if not level_dir.exists():
+        return None
+    for entry in level_dir.iterdir():
+        if not entry.name.endswith(".gii"):
+            continue
+        m = pattern.search(entry.name)
+        if m and int(m.group(1)) == label_id:
+            return entry
+    return None
+
+
+def _find_d99_surface(surfaces_dir, label_id, pattern):
+    """Find the D99 surface file for a label ID."""
+    surfaces_dir = Path(surfaces_dir)
+    if not surfaces_dir.exists():
+        return None
+    for entry in surfaces_dir.iterdir():
+        if not entry.name.endswith(".gii"):
+            continue
+        m = pattern.search(entry.name)
+        if m and int(m.group(1)) == label_id:
+            return entry
+    return None
+
+
+def _export_gifti_glb(
+    glb_path, verts, faces, *, mirror=False, target_faces=TARGET_FACES_GIFTI,
+):
+    """Load GIFTI arrays into a trimesh, optionally mirror, apply the world
+    x-flip, decimate to target_faces, bake normals, and export as GLB.
+
+    Returns the trimesh.Trimesh for introspection (e.g. face count).
+    """
+    import trimesh
+
+    if mirror:
+        mverts, mfaces = _mirror_mesh_x(verts, faces)
+        # Offset indices so we can concatenate into one vertex buffer.
+        mfaces_shifted = mfaces + len(verts)
+        combined_verts = np.vstack([verts, mverts])
+        combined_faces = np.vstack([faces, mfaces_shifted])
+    else:
+        combined_verts = verts
+        combined_faces = faces
+
+    mesh = _build_trimesh_from_arrays(combined_verts, combined_faces)
+
+    if len(mesh.faces) > target_faces:
+        mesh = mesh.simplify_quadric_decimation(face_count=target_faces)
+        _ = mesh.vertex_normals  # re-cache after decimation
+
+    mesh.export(str(glb_path), file_type="glb")
+    return mesh
+
+
+def _export_merged_gifti_glb(
+    glb_path, source_paths, *, mirror=False, target_faces=TARGET_FACES_GIFTI,
+    merge_duplicates=False,
+):
+    """Load and merge multiple GIFTI surfaces into a single GLB.
+
+    Each surface is optionally mirrored (e.g. D99's right-only surfs) before
+    concatenation. After merging we apply the world x-flip, decimate to
+    target_faces, bake normals, and export.
+    """
+    import trimesh
+
+    pieces_verts = []
+    pieces_faces = []
+    offset = 0
+    for path in source_paths:
+        verts, faces = load_gifti_mesh(path)
+        if mirror:
+            mverts, mfaces = _mirror_mesh_x(verts, faces)
+            pieces_verts.append(verts)
+            pieces_faces.append(faces + offset)
+            offset += len(verts)
+            pieces_verts.append(mverts)
+            pieces_faces.append(mfaces + offset)
+            offset += len(mverts)
+        else:
+            pieces_verts.append(verts)
+            pieces_faces.append(faces + offset)
+            offset += len(verts)
+
+    if not pieces_verts:
+        return None
+
+    combined_verts = np.vstack(pieces_verts)
+    combined_faces = np.vstack(pieces_faces)
+    mesh = _build_trimesh_from_arrays(
+        combined_verts, combined_faces, merge_duplicates=merge_duplicates,
+    )
+
+    if len(mesh.faces) > target_faces:
+        mesh = mesh.simplify_quadric_decimation(face_count=target_faces)
+        _ = mesh.vertex_normals
+
+    mesh.export(str(glb_path), file_type="glb")
+    return mesh
+
+
+def generate_meshes_from_gifti(
+    atlas, nifti_file, meshes_dir, id_to_structure, gifti_config, charm_entries=None,
+    template_nifti=None,
+):
+    """Generate GLB meshes from upstream GIFTI surfaces.
+
+    Parameters
+    ----------
+    atlas : str
+        Atlas key ("d99" or "nmt"). Controls which surface-lookup strategy to
+        use.
+    nifti_file : Path
+        Parcellation NIfTI. Only used to enumerate valid label IDs for D99 and
+        to mark labels with no mesh source; the mesh geometry itself comes
+        from the GIFTIs.
+    meshes_dir : Path
+        Output directory for GLB files.
+    id_to_structure : dict
+        Full structure graph; used to identify synthetic parents that need
+        merged meshes (e.g. D99 category nodes).
+    gifti_config : dict
+        Per-atlas surface configuration from ATLAS_CONFIGS.
+    charm_entries : list or None
+        CHARM label entries (with `level` metadata) for NMT. Required for NMT
+        to look up the right surface per label.
+    template_nifti : Path or None
+        Optional T1 template volume. If `gifti_config` does not provide a
+        whole-brain surface (e.g. D99 has only per-region surfaces), the root
+        mesh is generated by marching cubes on this template instead of
+        unioning region surfaces. This yields a watertight outline whose
+        Euler number is ~4 rather than thousands.
+
+    Returns
+    -------
+    list[int]
+        Label IDs that have no mesh file.
+    """
+    import nibabel as nib
+
+    meshes_dir.mkdir(parents=True, exist_ok=True)
+
+    img = nib.load(str(nifti_file))
+    atlas_data = np.asarray(img.dataobj, dtype=np.int16)
+    unique_labels = set(int(v) for v in np.unique(atlas_data)) - {0}
+
+    pattern = gifti_config["filename_pattern"]
+    mirror = gifti_config.get("mirror_hemisphere", False)
+
+    no_mesh = []
+    generated = 0
+    skipped_existing = 0
+    failed = 0
+
+    # --- Root mesh (whole brain) --------------------------------------------
+    root_glb = meshes_dir / f"{ROOT_ID}.glb"
+    if not root_glb.exists():
+        if atlas == "nmt":
+            lh = gifti_config["whole_brain_lh"]
+            rh = gifti_config["whole_brain_rh"]
+            print(f"Generating NMT root mesh from {lh.name} + {rh.name}")
+            mesh = _export_merged_gifti_glb(
+                root_glb, [lh, rh], mirror=False,
+                target_faces=ROOT_TARGET_FACES_GIFTI,
+            )
+            if mesh is not None:
+                print(f"  Root mesh: {len(mesh.faces)} faces")
+                generated += 1
+        elif atlas == "d99":
+            # D99 ships no whole-brain surface. If a T1 template is available
+            # we prefer marching cubes on it: the resulting isosurface is
+            # watertight (Euler ≈ 4), whereas unioning 365 per-region surfaces
+            # leaves ~28 000 small boundary holes. Falls back to the union if
+            # no template is provided.
+            if template_nifti is not None:
+                print(
+                    f"Generating D99 root mesh from template: {template_nifti.name}"
+                )
+                mesh = _export_template_root_glb(
+                    template_nifti, root_glb, ROOT_TARGET_FACES_GIFTI,
+                )
+                if mesh is not None:
+                    print(f"  Root mesh: {len(mesh.faces)} faces")
+                    generated += 1
+            else:
+                print("Generating D99 root mesh from union of all region surfaces")
+                sources = []
+                for label_id in sorted(unique_labels):
+                    p = _find_d99_surface(
+                        gifti_config["surfaces_dir"], label_id, pattern,
+                    )
+                    if p is not None:
+                        sources.append(p)
+                if sources:
+                    mesh = _export_merged_gifti_glb(
+                        root_glb, sources, mirror=mirror,
+                        target_faces=ROOT_TARGET_FACES_GIFTI,
+                        merge_duplicates=True,
+                    )
+                    if mesh is not None:
+                        print(f"  Root mesh: {len(mesh.faces)} faces from {len(sources)} sources")
+                        generated += 1
+                else:
+                    print("  WARNING: no D99 surfaces found for root mesh")
+                    no_mesh.append(ROOT_ID)
+    else:
+        skipped_existing += 1
+
+    # --- Per-region leaf meshes ---------------------------------------------
+    if atlas == "d99":
+        # Every entry in `id_to_structure` whose ID is a D99 label should have
+        # a corresponding surface file. Synthetic category / subcategory nodes
+        # (IDs >= CATEGORY_ID_START) do not and are merged below.
+        for label_id, node in sorted(id_to_structure.items()):
+            if label_id in (ROOT_ID, OUTSIDE_ID):
+                continue
+            if label_id >= CATEGORY_ID_START:
+                continue  # synthetic parent; handled via merge pass
+            glb_path = meshes_dir / f"{label_id}.glb"
+            if glb_path.exists():
+                skipped_existing += 1
+                continue
+            source = _find_d99_surface(
+                gifti_config["surfaces_dir"], label_id, pattern,
+            )
+            if source is None:
+                no_mesh.append(label_id)
+                continue
+            try:
+                verts, faces = load_gifti_mesh(source)
+                _export_gifti_glb(
+                    glb_path, verts, faces, mirror=mirror,
+                    target_faces=TARGET_FACES_GIFTI,
+                )
+                generated += 1
+                if generated % 50 == 0:
+                    print(f"  Generated {generated} meshes...")
+            except Exception as exc:
+                print(f"  Failed mesh for label {label_id}: {exc}")
+                failed += 1
+                no_mesh.append(label_id)
+
+    elif atlas == "nmt":
+        if charm_entries is None:
+            raise ValueError("charm_entries required for NMT GIFTI mesh generation")
+        # Each CHARM entry carries its own native hierarchy level. Surfaces at
+        # level N live under `atlases/CHARM/Level_N/`.
+        charm_levels_dir = gifti_config["charm_levels_dir"]
+        for entry in sorted(charm_entries, key=lambda e: e["index"]):
+            label_id = entry["index"]
+            level = entry["level"]
+            glb_path = meshes_dir / f"{label_id}.glb"
+            if glb_path.exists():
+                skipped_existing += 1
+                continue
+            source = _find_charm_surface(
+                charm_levels_dir, level, label_id, pattern,
+            )
+            if source is None:
+                no_mesh.append(label_id)
+                continue
+            try:
+                verts, faces = load_gifti_mesh(source)
+                _export_gifti_glb(
+                    glb_path, verts, faces, mirror=mirror,
+                    target_faces=TARGET_FACES_GIFTI,
+                )
+                generated += 1
+                if generated % 50 == 0:
+                    print(f"  Generated {generated} meshes...")
+            except Exception as exc:
+                print(f"  Failed mesh for label {label_id}: {exc}")
+                failed += 1
+                no_mesh.append(label_id)
+
+    # --- Synthetic parent meshes --------------------------------------------
+    # Nodes that aren't backed by a surface file need their mesh merged from
+    # descendant leaves. For D99 these are the synthetic category/subcategory
+    # nodes (IDs >= CATEGORY_ID_START). For NMT/CHARM the hierarchy nodes with
+    # surfaces are already handled; only the rare entry missing a surface (the
+    # 8 hippocampal subdivisions) falls through here.
+    children_map = {}
+    for node_id, node in id_to_structure.items():
+        pid = node.get("parent_structure_id")
+        if pid is not None:
+            children_map.setdefault(pid, []).append(node_id)
+
+    def _descendant_leaves_with_meshes(parent_id):
+        leaves = []
+        stack = list(children_map.get(parent_id, []))
+        while stack:
+            cid = stack.pop()
+            cid_glb = meshes_dir / f"{cid}.glb"
+            if cid_glb.exists() and cid >= 0:
+                # Any descendant with an on-disk mesh counts as a merge source.
+                # We still recurse so that deeper subdivisions also contribute
+                # when a parent node has its own mesh (rare but possible).
+                leaves.append(cid_glb)
+            stack.extend(children_map.get(cid, []))
+        return leaves
+
+    parent_generated = 0
+    for node_id, node in sorted(id_to_structure.items()):
+        if node_id in (ROOT_ID, OUTSIDE_ID):
+            continue
+        glb_path = meshes_dir / f"{node_id}.glb"
+        if glb_path.exists():
+            continue
+        # Only merge-build synthetic parents that don't have direct surfaces.
+        # (For CHARM, label IDs without a surface file would also land here;
+        # they inherit from their descendants.)
+        leaf_glbs = _descendant_leaves_with_meshes(node_id)
+        if not leaf_glbs:
+            no_mesh.append(node_id)
+            continue
+        try:
+            import trimesh
+            pieces = [trimesh.load(str(p), force="mesh") for p in leaf_glbs]
+            merged = trimesh.util.concatenate(pieces)
+            if len(merged.faces) > TARGET_FACES_GIFTI:
+                merged = merged.simplify_quadric_decimation(
+                    face_count=TARGET_FACES_GIFTI,
+                )
+            _ = merged.vertex_normals
+            merged.export(str(glb_path), file_type="glb")
+            parent_generated += 1
+        except Exception as exc:
+            print(f"  Failed parent mesh for {node_id}: {exc}")
+            no_mesh.append(node_id)
+
+    print(f"  Parent meshes generated: {parent_generated}")
+
+    # OUTSIDE_ID never has a mesh; category nodes without a file also go here.
+    no_mesh.append(OUTSIDE_ID)
+    for node_id in id_to_structure:
+        if node_id >= CATEGORY_ID_START:
+            if not (meshes_dir / f"{node_id}.glb").exists():
+                no_mesh.append(node_id)
+
+    print(
+        f"Meshes: {generated} leaf + {parent_generated} parent generated, "
+        f"{skipped_existing} existing, {failed} failed, {len(set(no_mesh))} no mesh"
     )
     return sorted(set(no_mesh))
 
@@ -1215,9 +1987,19 @@ def main():
         tree, id_to_structure, parent_map, abbrev_to_id = build_charm_structure_graph(
             entries, root_name=config["root_name"],
         )
+    elif config["labels_type"] == "mebrains":
+        mebrains_colors = load_mebrains_palette_from_siibra()
+        tree, id_to_structure, parent_map, abbrev_to_id = build_structure_graph(
+            entries,
+            root_name=config["root_name"],
+            color_overrides=mebrains_colors,
+            labels_type="mebrains",
+        )
     else:
         tree, id_to_structure, parent_map, abbrev_to_id = build_structure_graph(
-            entries, root_name=config["root_name"],
+            entries,
+            root_name=config["root_name"],
+            labels_type=config["labels_type"],
         )
 
     with open(data_dir / "structure_graph.json", "w") as f:
@@ -1232,11 +2014,25 @@ def main():
         for nid in id_to_structure:
             if nid >= CATEGORY_ID_START and not (meshes_dir / f"{nid}.glb").exists():
                 no_mesh.append(nid)
+    elif config.get("gifti_surfaces") is not None:
+        print("Generating meshes from upstream GIFTI surfaces...")
+        no_mesh = generate_meshes_from_gifti(
+            args.atlas, config["nifti"], meshes_dir, id_to_structure,
+            config["gifti_surfaces"],
+            charm_entries=entries if config["labels_type"] == "charm" else None,
+            template_nifti=config.get("template_nifti"),
+        )
     else:
         print("Generating meshes from NIfTI volume...")
+        root_pial_surfaces = None
+        if args.atlas == "mebrains":
+            lh_pial, rh_pial = ensure_mebrains_pial_cache()
+            if lh_pial is not None and rh_pial is not None:
+                root_pial_surfaces = [lh_pial, rh_pial]
         no_mesh = generate_meshes(
             config["nifti"], meshes_dir, id_to_structure,
             template_nifti=config.get("template_nifti"),
+            root_pial_surfaces=root_pial_surfaces,
         )
 
     # DANDI data
@@ -1251,6 +2047,44 @@ def main():
                 dandi_regions = json.load(f)
             asset_count = sum(len(v) for v in dandiset_assets.values())
             print(f"  Reused {asset_count} asset entries, {len(dandi_regions)} regions")
+
+            # Robustness: the loaded dandi_regions / dandiset_assets snapshots may
+            # contain stale region colours/names/acronyms from before a palette or
+            # hierarchy change. Re-sync those fields from the freshly-built
+            # structure graph so palette edits propagate without needing a full
+            # DANDI refetch. The viewer reads region colour from dandi_regions.json
+            # first (loadMesh in app.js), so this matters.
+            synced_regions = 0
+            for rid_str, region_data in dandi_regions.items():
+                try:
+                    rid = int(rid_str)
+                except (TypeError, ValueError):
+                    continue
+                s = id_to_structure.get(rid)
+                if s is None:
+                    continue
+                if region_data.get("color_hex_triplet") != s.get("color_hex_triplet"):
+                    region_data["color_hex_triplet"] = s.get("color_hex_triplet")
+                    synced_regions += 1
+                # Keep acronym/name aligned with the current structure graph too.
+                if "acronym" in s:
+                    region_data["acronym"] = s["acronym"]
+                if "name" in s:
+                    region_data["name"] = s["name"]
+            if synced_regions:
+                print(f"  Re-synced colours for {synced_regions} regions from current structure graph")
+
+            # Do the same for per-asset embedded regions inside dandiset_assets.
+            for atlas_dandisets in dandiset_assets.values():
+                for asset in atlas_dandisets:
+                    for r in asset.get("regions") or []:
+                        s = id_to_structure.get(r.get("id"))
+                        if s is None:
+                            continue
+                        if "acronym" in s:
+                            r["acronym"] = s["acronym"]
+                        if "name" in s:
+                            r["name"] = s["name"]
         except FileNotFoundError:
             print("  No existing DANDI outputs to reuse; writing empty placeholders")
             dandiset_assets = {DANDISET_ID: []}

@@ -16,6 +16,9 @@ scripts/d99_electrode_cache.jsonl
 scripts/nmt_electrode_cache.jsonl
 scripts/mebrains_electrode_cache.jsonl
 scripts/*_electrode_cache.jsonl.bak
+scripts/siibra_mebrains_palette.json
+scripts/mebrains_pial_lh.gii
+scripts/mebrains_pial_rh.gii
 
 # Playwright render diagnostics
 debug_output/
