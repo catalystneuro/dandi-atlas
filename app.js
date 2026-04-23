@@ -559,9 +559,10 @@ function onMouseMove(event) {
 
   raycaster.setFromCamera(mouse, camera);
 
-  // Only pick visible data meshes
+  // Only pick visible data meshes; for macaque also include root so clicking
+  // the outline resets to overview.
   const pickable = Object.values(meshObjects).filter(
-    m => m.userData.isData && m.visible
+    m => m.visible && (m.userData.isData || (m.userData.isRoot && activeAtlas.coordSystem !== 'allen'))
   );
   const intersects = raycaster.intersectObjects(pickable, false);
 
@@ -631,12 +632,18 @@ function onClick(event) {
 
   raycaster.setFromCamera(mouse, camera);
 
-  const pickable = Object.values(meshObjects).filter(m => m.userData.isData && m.visible);
+  const pickable = Object.values(meshObjects).filter(
+    m => m.visible && (m.userData.isData || (m.userData.isRoot && activeAtlas.coordSystem !== 'allen'))
+  );
   const intersects = raycaster.intersectObjects(pickable, false);
 
   if (intersects.length > 0) {
-    const sid = intersects[0].object.userData.structureId;
-    if (selectedDandiset) {
+    const hit = intersects[0].object;
+    const sid = hit.userData.structureId;
+    if (hit.userData.isRoot) {
+      if (selectedDandiset) clearDandisetFilter();
+      selectRegion(meshManifest.root_id);
+    } else if (selectedDandiset) {
       filterDandisetPanelByRegion(sid);
     } else {
       selectRegion(sid);
@@ -673,18 +680,44 @@ function applyDimmed(mesh) {
     // ancestor. Revisit the policy when that happens. See
     // obsidian_docs/3d_visualization/atlas_visibility_and_opacity_policy.md
     if (mesh.userData.isRoot) {
-      const orig = mesh.userData.originalMaterial;
-      const mat = orig.clone();
-      mat.opacity = 0.15;
-      mat.transparent = true;
-      mat.depthTest = false;
-      mat.depthWrite = false;
-      // Outline mode needs DoubleSide so the far wall of the brain is visible
-      // through the translucent near wall. FrontSide (used for the solid root
-      // at init) culls back faces and makes the outline look like a half-shell.
-      mat.side = THREE.DoubleSide;
-      mat.needsUpdate = true;
-      mesh.material = mat;
+      if (!mesh.userData.outlineMaterial) {
+        const orig = mesh.userData.originalMaterial;
+        const color = orig.color ? orig.color.clone() : new THREE.Color(0xcccccc);
+        mesh.userData.outlineMaterial = new THREE.ShaderMaterial({
+          uniforms: {
+            uColor: { value: color },
+            uRimPower: { value: 2.5 },
+            uRimStrength: { value: 0.9 },
+          },
+          vertexShader: `
+            varying vec3 vNormal;
+            varying vec3 vViewDir;
+            void main() {
+              vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+              vNormal = normalize(normalMatrix * normal);
+              vViewDir = normalize(-mvPosition.xyz);
+              gl_Position = projectionMatrix * mvPosition;
+            }
+          `,
+          fragmentShader: `
+            uniform vec3 uColor;
+            uniform float uRimPower;
+            uniform float uRimStrength;
+            varying vec3 vNormal;
+            varying vec3 vViewDir;
+            void main() {
+              float facing = abs(dot(normalize(vNormal), vViewDir));
+              float rim = pow(1.0 - facing, uRimPower);
+              gl_FragColor = vec4(uColor, rim * uRimStrength);
+            }
+          `,
+          transparent: true,
+          depthTest: true,
+          depthWrite: false,
+          side: THREE.FrontSide,
+        });
+      }
+      mesh.material = mesh.userData.outlineMaterial;
       mesh.renderOrder = -1;
       mesh.visible = true;
     } else {
