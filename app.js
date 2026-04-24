@@ -605,15 +605,7 @@ function onMouseMove(event) {
     }
   }
 
-  // Pick visible data meshes. Root is also pickable but only when it's not
-  // in the dimmed outline state — i.e. at the init (atlas) view only. That
-  // gates the root tooltip to the init view and prevents the stale
-  // "0 dandisets" flash that stale dandi_regions entries would otherwise
-  // cause on hover of the silhouette during a selection.
-  const pickable = Object.values(meshObjects).filter(
-    m => m.visible && (m.userData.isData || (m.userData.isRoot && !m.userData.isDimmed))
-  );
-  const intersects = raycaster.intersectObjects(pickable, false);
+  const intersects = raycaster.intersectObjects(getHoverPickables(), false);
   const brainHit = pickBrainRegionHit(intersects);
 
   if (brainHit) {
@@ -686,8 +678,7 @@ function onClick(event) {
 
   raycaster.setFromCamera(mouse, camera);
 
-  const pickable = Object.values(meshObjects).filter(m => m.userData.isData && m.visible);
-  const intersects = raycaster.intersectObjects(pickable, false);
+  const intersects = raycaster.intersectObjects(getClickPickables(), false);
   const brainHit = pickBrainRegionHit(intersects);
 
   if (brainHit) {
@@ -698,6 +689,23 @@ function onClick(event) {
       selectRegion(sid);
     }
   }
+}
+
+// Hover includes root when it's the solid init-view mesh, so hovering the
+// whole brain at the atlas view surfaces the aggregate tooltip. Root is
+// excluded while dimmed (fresnel silhouette during selection) — the rim is
+// pure context, not a UI target.
+function getHoverPickables() {
+  return Object.values(meshObjects).filter(
+    m => m.visible && (m.userData.isData || (m.userData.isRoot && !m.userData.isDimmed))
+  );
+}
+
+// Click never targets root. Navigation back to the init view goes through
+// the hierarchy tree's root node, not the 3D mesh — giving root a click
+// action would create a large accidental-click surface during camera drags.
+function getClickPickables() {
+  return Object.values(meshObjects).filter(m => m.userData.isData && m.visible);
 }
 
 function pickBrainRegionHit(intersects) {
