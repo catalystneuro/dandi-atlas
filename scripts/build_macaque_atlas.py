@@ -167,7 +167,7 @@ TARGET_FACES = 10_000
 # Region meshes stay at TARGET_FACES since they're smaller and overlap with each other.
 # Root is rendered transparent + DoubleSide, so keep this modest — each face costs
 # 2x to draw and enters the transparent-queue sort path.
-ROOT_TARGET_FACES = 50_000
+ROOT_TARGET_FACES = 100_000
 # GIFTI surfaces ship with their own smooth, well-balanced triangulation
 # (median dihedral ≈ 0°, mean ≈ 10°). Aggressive quadric decimation destroys
 # this quality — pushing the mean above 25°. We keep the GIFTI target much
@@ -975,6 +975,15 @@ def _export_template_root_glb(template_nifti, root_glb, target_faces, level=50.0
     # where the camera peeks through a hole in the near wall to the back
     # wall's front face.
     trimesh.repair.fill_holes(mesh)
+    # Decimate to the target face count. Raw MC output is ~240k faces which
+    # caused MEBRAINS to run at 8 FPS at init. We decimate *after* hole
+    # filling and *before* winding normalization so the output has both a
+    # manageable face count AND correctly outward-facing normals. Quadric
+    # decimation can introduce a small number of non-manifold edges but
+    # they no longer produce the rotate-to-see-through bug now that the
+    # dominant problem (globally-inverted winding) is fixed downstream.
+    if len(mesh.faces) > target_faces:
+        mesh = mesh.simplify_quadric_decimation(face_count=target_faces)
     # Normalize face winding so normals point outward. The marching-cubes
     # output winding combined with our x-flip can produce a shell whose
     # normals point INWARD — under Three.js FrontSide culling this means
@@ -983,11 +992,6 @@ def _export_template_root_glb(template_nifti, root_glb, target_faces, level=50.0
     mesh.faces = _normalize_winding_outward(
         np.asarray(mesh.vertices), np.asarray(mesh.faces),
     )
-    # Skip quadric decimation: it was the source of the non-manifold edges
-    # (see debug_output/see_through). Raw MC + fill_holes gives a clean
-    # watertight shell at the cost of a ~5x larger mesh (5-6 MB typical).
-    # The target_faces argument is kept for signature compatibility but is
-    # ignored here; revisit if GPU frame cost becomes a problem.
     _ = mesh.vertex_normals  # bake normals for GLB export
     mesh.export(str(root_glb), file_type="glb")
     return mesh
