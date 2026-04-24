@@ -549,17 +549,13 @@ async function loadInitialMeshes() {
     // CCF: only load data structures (original behavior)
     allToLoad = meshManifest.data_structures.filter(id => id !== meshManifest.root_id);
   } else {
-    // Macaque: discover all mesh files for full anatomical context
-    let allMeshIds;
-    try {
-      const meshDir = `${activeAtlas.dataPrefix}meshes/`;
-      const resp = await fetch(meshDir);
-      const html = await resp.text();
-      const matches = html.matchAll(/href="(\d+)\.glb"/g);
-      allMeshIds = [...matches].map(m => parseInt(m[1]));
-    } catch {
-      allMeshIds = [...meshManifest.data_structures];
-    }
+    // Macaque: load every GLB produced by the build so the anatomical tree
+    // is fully populated even when the user navigates to a non-data region.
+    // The list is precomputed into meshManifest.all_meshes by the build
+    // script. We used to scrape the server's HTML directory index at runtime,
+    // but that relies on auto-indexing which Netlify (and most CDNs) don't
+    // serve, so the deployed site was falling back to data_structures only.
+    const allMeshIds = meshManifest.all_meshes || meshManifest.data_structures;
     allToLoad = allMeshIds.filter(id =>
       id !== meshManifest.root_id && !noMeshIds.has(id)
     );

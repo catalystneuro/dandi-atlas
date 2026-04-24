@@ -2163,10 +2163,21 @@ def main():
         for anc in get_ancestors(sid, parent_map):
             ancestor_ids.add(anc)
 
+    # `all_meshes` is the concrete list of GLB files this build produced. The
+    # viewer uses it at load time to populate the macaque anatomical context
+    # without relying on the server to generate an HTML directory listing —
+    # Netlify and most CDNs do not, which left non-data regions absent on the
+    # deployed site.
+    meshes_dir = data_dir / "meshes"
+    all_mesh_ids = sorted(
+        int(p.stem) for p in meshes_dir.glob("*.glb") if p.stem.lstrip("-").isdigit()
+    )
+
     mesh_manifest = {
         "data_structures": sorted(data_ids),
         "ancestor_structures": sorted(ancestor_ids - data_ids),
         "no_mesh": sorted(set(no_mesh)),
+        "all_meshes": all_mesh_ids,
         "root_id": ROOT_ID,
     }
     with open(data_dir / "mesh_manifest.json", "w") as f:
