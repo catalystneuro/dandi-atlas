@@ -79,27 +79,23 @@ SIIBRA_MEBRAINS_LABELLED_MAP_URL = (
 )
 SIIBRA_MEBRAINS_PALETTE_CACHE = SCRIPTS_DIR / "siibra_mebrains_palette.json"
 
-# MEBRAINS hand-curated pial surfaces (FreeSurfer) hosted on the EBRAINS
-# public data-proxy. Prefer these over marching cubes on the T1 template for
-# the root outline: the pials are watertight hemispheres (~100k verts each)
-# with clean sulcal geometry, while MC-on-T1 picks up noise and imaging
-# artefacts. Cached locally after first download.
-MEBRAINS_PIAL_BUCKET = (
-    "https://data-proxy.ebrains.eu/api/v1/buckets/"
-    "d-9414c255-ba26-4b4b-ae0b-7e0a48140b0c"
+# D99 whole-brain cortical surfaces from HumanBrainED/RheMAP-Surf. AFNI's D99
+# v2 distribution does NOT ship whole-brain surfaces (only per-ROI meshes
+# under surfs_right/), so before this cache existed the D99 root was built by
+# marching cubes on D99_template.nii.gz — watertight enough, but visually
+# washed out compared to NMT's per-subject gray_surface.rsl.gii. RheMAP-Surf
+# publishes CIVET-macaque-derived pial surfaces in scanner-RAS co-registered
+# to the same D99_template.nii.gz we already use. 167k verts/hemisphere.
+D99_PIAL_LH_URL = (
+    "https://raw.githubusercontent.com/HumanBrainED/RheMAP-Surf/main/"
+    "templates/D99/D99_L_AVG_T1_v2.L.PIAL.167625.surf.gii"
 )
-# Objects live under v1.0/MEBRAINS_surface_templates/. redirect=true makes the
-# data-proxy redirect to the signed CSCS Ceph URL in one request.
-MEBRAINS_PIAL_LH_URL = (
-    f"{MEBRAINS_PIAL_BUCKET}/v1.0/MEBRAINS_surface_templates/"
-    f"lh.MEBRAINS.pial.gii?redirect=true"
+D99_PIAL_RH_URL = (
+    "https://raw.githubusercontent.com/HumanBrainED/RheMAP-Surf/main/"
+    "templates/D99/D99_L_AVG_T1_v2.R.PIAL.167625.surf.gii"
 )
-MEBRAINS_PIAL_RH_URL = (
-    f"{MEBRAINS_PIAL_BUCKET}/v1.0/MEBRAINS_surface_templates/"
-    f"rh.MEBRAINS.pial.gii?redirect=true"
-)
-MEBRAINS_PIAL_LH_CACHE = SCRIPTS_DIR / "mebrains_pial_lh.gii"
-MEBRAINS_PIAL_RH_CACHE = SCRIPTS_DIR / "mebrains_pial_rh.gii"
+D99_PIAL_LH_CACHE = SCRIPTS_DIR / "d99_pial_lh.surf.gii"
+D99_PIAL_RH_CACHE = SCRIPTS_DIR / "d99_pial_rh.surf.gii"
 
 ATLAS_CONFIGS = {
     "d99": {
@@ -115,6 +111,11 @@ ATLAS_CONFIGS = {
         # bilateral parcellation volume.
         "gifti_surfaces": {
             "surfaces_dir": TURNER_DATA / "d99_atlas/D99_v2.0_dist/surfs_right",
+            # Whole-brain root surfaces from RheMAP-Surf (fetched by
+            # ensure_d99_pial_cache on first build). Cached paths only — the
+            # ensure function populates them from GitHub before build runs.
+            "whole_brain_lh": D99_PIAL_LH_CACHE,
+            "whole_brain_rh": D99_PIAL_RH_CACHE,
             "filename_pattern": re.compile(r"\.k(\d+)\.gii$"),
             "mirror_hemisphere": True,
         },
@@ -535,21 +536,21 @@ def load_mebrains_palette_from_siibra():
     return palette
 
 
-def ensure_mebrains_pial_cache():
-    """Download the MEBRAINS lh/rh pial GIFTIs to the scripts cache if absent.
+def ensure_d99_pial_cache():
+    """Download D99 RheMAP-Surf pial surfaces to the scripts cache if absent.
 
-    Returns a tuple (lh_path, rh_path) pointing to local cached files, or
-    (None, None) if either download failed (caller should fall back to the
-    marching-cubes path on the T1 template).
+    The AFNI D99 v2 distribution ships no whole-brain surface, so we pull
+    from the HumanBrainED/RheMAP-Surf community repository. Files are ~8 MB
+    each; first build downloads them once, subsequent builds use the cache.
     """
     targets = [
-        (MEBRAINS_PIAL_LH_URL, MEBRAINS_PIAL_LH_CACHE),
-        (MEBRAINS_PIAL_RH_URL, MEBRAINS_PIAL_RH_CACHE),
+        (D99_PIAL_LH_URL, D99_PIAL_LH_CACHE),
+        (D99_PIAL_RH_URL, D99_PIAL_RH_CACHE),
     ]
     for url, dest in targets:
         if dest.exists() and dest.stat().st_size > 0:
             continue
-        print(f"  Fetching {dest.name} from EBRAINS data-proxy...")
+        print(f"  Fetching {dest.name} from RheMAP-Surf...")
         try:
             with urllib.request.urlopen(url) as response:
                 data = response.read()
@@ -558,7 +559,7 @@ def ensure_mebrains_pial_cache():
         except (urllib.error.URLError, urllib.error.HTTPError, OSError) as exc:
             print(f"    WARNING: could not fetch {url}: {exc}")
             return None, None
-    return MEBRAINS_PIAL_LH_CACHE, MEBRAINS_PIAL_RH_CACHE
+    return D99_PIAL_LH_CACHE, D99_PIAL_RH_CACHE
 
 
 def build_charm_structure_graph(entries, root_name="NMT v2.0 sym (CHARM)"):
@@ -949,6 +950,15 @@ def _export_template_root_glb(template_nifti, root_glb, target_faces, level=50.0
     # Gaussian pre-smooth matches per-region MC blur (sigma=1.0) so the
     # isosurface is smoother than raw marching cubes on noisy MRI data.
     t1_smooth = gaussian_filter(t1_data, sigma=1.0)
+    # Pad with zeros so the isosurface can never touch the grid boundary,
+    # which would produce open edges in the MC output. The +1 voxel offset
+    # in the affine compensates for the added padding so world coords stay
+    # correct. Without this MEBRAINS produced ~66 boundary edges where the
+    # brain touched the image edge.
+    t1_smooth = np.pad(t1_smooth, 1, mode="constant", constant_values=0.0)
+    pad_offset = t1_affine[:3, :3] @ np.array([-1.0, -1.0, -1.0])
+    t1_affine = t1_affine.copy()
+    t1_affine[:3, 3] += pad_offset
     verts, faces, _, _ = marching_cubes(t1_smooth, level=level)
     verts_homogeneous = np.column_stack([verts, np.ones(len(verts))])
     verts_world = (t1_affine @ verts_homogeneous.T).T[:, :3]
@@ -960,8 +970,24 @@ def _export_template_root_glb(template_nifti, root_glb, target_faces, level=50.0
     if len(components) > 1:
         components.sort(key=lambda c: len(c.faces), reverse=True)
         mesh = components[0]
-    if len(mesh.faces) > target_faces:
-        mesh = mesh.simplify_quadric_decimation(face_count=target_faces)
+    # Close any small holes introduced by MC at the grid boundary or in thin
+    # tissue regions. This prevents the "see-through when rotating" effect
+    # where the camera peeks through a hole in the near wall to the back
+    # wall's front face.
+    trimesh.repair.fill_holes(mesh)
+    # Normalize face winding so normals point outward. The marching-cubes
+    # output winding combined with our x-flip can produce a shell whose
+    # normals point INWARD — under Three.js FrontSide culling this means
+    # the surface disappears when viewed from outside, exposing the
+    # opposite wall's inside-facing geometry ("see-through when rotating").
+    mesh.faces = _normalize_winding_outward(
+        np.asarray(mesh.vertices), np.asarray(mesh.faces),
+    )
+    # Skip quadric decimation: it was the source of the non-manifold edges
+    # (see debug_output/see_through). Raw MC + fill_holes gives a clean
+    # watertight shell at the cost of a ~5x larger mesh (5-6 MB typical).
+    # The target_faces argument is kept for signature compatibility but is
+    # ignored here; revisit if GPU frame cost becomes a problem.
     _ = mesh.vertex_normals  # bake normals for GLB export
     mesh.export(str(root_glb), file_type="glb")
     return mesh
@@ -969,15 +995,12 @@ def _export_template_root_glb(template_nifti, root_glb, target_faces, level=50.0
 
 def generate_meshes(
     nifti_file, meshes_dir, id_to_structure, template_nifti=None,
-    root_pial_surfaces=None,
 ):
     """Generate GLB meshes from a NIfTI atlas volume.
 
-    If root_pial_surfaces is provided (a list of GIFTI Paths), the root mesh
-    is built from their union, matching the MEBRAINS case where hand-curated
-    FreeSurfer pial hemispheres are higher quality than marching cubes on the
-    T1 template. Falls back to template_nifti (MC on T1) if pials are
-    unavailable, or to the parcellation union as a last resort.
+    Root mesh: marching cubes on template_nifti if provided, else on the
+    parcellation union as a fallback. See atlas_meshes_and_volumes.md for
+    why the MEBRAINS pial-surfaces path was removed (open-midline shells).
 
     Returns list of label IDs that have no mesh.
     """
@@ -1002,28 +1025,7 @@ def generate_meshes(
     # Root mesh (whole brain outline)
     root_glb = meshes_dir / f"{ROOT_ID}.glb"
     if not root_glb.exists():
-        if root_pial_surfaces:
-            # Prefer upstream pial surfaces (e.g. MEBRAINS FreeSurfer pials).
-            # These are watertight per-hemisphere meshes, already smooth, so
-            # we only concatenate + decimate to the GIFTI root face cap.
-            names = ", ".join(Path(p).name for p in root_pial_surfaces)
-            print(f"Generating root mesh from pial surfaces: {names}")
-            mesh = _export_merged_gifti_glb(
-                root_glb, root_pial_surfaces, mirror=False,
-                target_faces=ROOT_TARGET_FACES_GIFTI,
-            )
-            if mesh is not None:
-                print(f"  Root mesh: {len(mesh.faces)} faces")
-                generated += 1
-            else:
-                print("  WARNING: pial surface load failed; falling back to T1 template")
-                if template_nifti:
-                    mesh = _export_template_root_glb(
-                        template_nifti, root_glb, ROOT_TARGET_FACES,
-                    )
-                    print(f"  Root mesh: {len(mesh.faces)} faces")
-                    generated += 1
-        elif template_nifti:
+        if template_nifti:
             # Use T1 template for a complete brain surface.
             print(f"Generating root mesh from template: {template_nifti.name}")
             mesh = _export_template_root_glb(
@@ -1218,6 +1220,46 @@ def _apply_world_flip(verts):
     return out
 
 
+def _normalize_winding_outward(verts, faces, sample_size=200):
+    """Return `faces` with winding ensuring normals point outward on average.
+
+    Some upstream GIFTI distributions (notably RheMAP-Surf for D99) ship LH
+    and RH pial surfaces with opposite winding conventions — LH with normals
+    pointing inward and RH outward (or vice versa). Rendering with FrontSide
+    culling produces a visible hemisphere on one side and a chunky
+    inside-out shell on the other. We check the sign of the average dot
+    product between face normals and the outward direction (face centroid
+    minus mesh centroid), and flip winding if negative.
+    """
+    import random
+    if len(faces) == 0:
+        return faces
+    centroid = verts.mean(axis=0)
+    n = min(sample_size, len(faces))
+    rng = random.Random(0)
+    idx = rng.sample(range(len(faces)), n)
+    dots = []
+    for i in idx:
+        fi = faces[i]
+        v0, v1, v2 = verts[fi[0]], verts[fi[1]], verts[fi[2]]
+        normal = np.cross(v1 - v0, v2 - v0)
+        nrm = np.linalg.norm(normal)
+        if nrm < 1e-12:
+            continue
+        normal = normal / nrm
+        fc = (v0 + v1 + v2) / 3
+        outward = fc - centroid
+        onrm = np.linalg.norm(outward)
+        if onrm < 1e-12:
+            continue
+        dots.append(float(np.dot(normal, outward / onrm)))
+    if not dots:
+        return faces
+    if sum(dots) / len(dots) < 0:
+        return faces[:, ::-1].copy()
+    return faces
+
+
 def _mirror_mesh_x(verts, faces):
     """Mirror a mesh across X=0 and flip face winding to preserve front-facing
     normals.
@@ -1332,6 +1374,10 @@ def _export_merged_gifti_glb(
     offset = 0
     for path in source_paths:
         verts, faces = load_gifti_mesh(path)
+        # Normalize per-piece winding so all pieces have outward normals.
+        # RheMAP-Surf D99 pials ship LH inward / RH outward; without this
+        # one hemisphere renders inside-out under FrontSide culling.
+        faces = _normalize_winding_outward(verts, faces)
         if mirror:
             mverts, mfaces = _mirror_mesh_x(verts, faces)
             pieces_verts.append(verts)
@@ -1418,10 +1464,13 @@ def generate_meshes_from_gifti(
     # --- Root mesh (whole brain) --------------------------------------------
     root_glb = meshes_dir / f"{ROOT_ID}.glb"
     if not root_glb.exists():
-        if atlas == "nmt":
-            lh = gifti_config["whole_brain_lh"]
-            rh = gifti_config["whole_brain_rh"]
-            print(f"Generating NMT root mesh from {lh.name} + {rh.name}")
+        lh = gifti_config.get("whole_brain_lh")
+        rh = gifti_config.get("whole_brain_rh")
+        if lh is not None and rh is not None and Path(lh).exists() and Path(rh).exists():
+            # Prefer an upstream whole-brain surface pair (NMT: gray_surface,
+            # D99: RheMAP-Surf pial). Watertight, high-detail, no marching
+            # cubes involved.
+            print(f"Generating {atlas} root mesh from {Path(lh).name} + {Path(rh).name}")
             mesh = _export_merged_gifti_glb(
                 root_glb, [lh, rh], mirror=False,
                 target_faces=ROOT_TARGET_FACES_GIFTI,
@@ -1430,11 +1479,7 @@ def generate_meshes_from_gifti(
                 print(f"  Root mesh: {len(mesh.faces)} faces")
                 generated += 1
         elif atlas == "d99":
-            # D99 ships no whole-brain surface. If a T1 template is available
-            # we prefer marching cubes on it: the resulting isosurface is
-            # watertight (Euler ≈ 4), whereas unioning 365 per-region surfaces
-            # leaves ~28 000 small boundary holes. Falls back to the union if
-            # no template is provided.
+            # Fallback only if the pial cache is missing (offline build).
             if template_nifti is not None:
                 print(
                     f"Generating D99 root mesh from template: {template_nifti.name}"
@@ -2016,6 +2061,10 @@ def main():
                 no_mesh.append(nid)
     elif config.get("gifti_surfaces") is not None:
         print("Generating meshes from upstream GIFTI surfaces...")
+        # D99 whole-brain pial from RheMAP-Surf is fetched on-demand (the AFNI
+        # D99 distribution itself has no whole-brain surface).
+        if args.atlas == "d99":
+            ensure_d99_pial_cache()
         no_mesh = generate_meshes_from_gifti(
             args.atlas, config["nifti"], meshes_dir, id_to_structure,
             config["gifti_surfaces"],
@@ -2024,18 +2073,13 @@ def main():
         )
     else:
         print("Generating meshes from NIfTI volume...")
-        # MEBRAINS ships its pial as two separate LH / RH FreeSurfer shells
-        # with an open midline. Using them as the root leaves every medial-wall
-        # parcellation label (e.g. PEc, PEl, Opt, medial motor areas) falling
-        # into that gap, visually protruding from the outline. Marching cubes
-        # on MEBRAINS_T1.nii.gz gives a single watertight shell that wraps
-        # both hemispheres and the midline, with a smoother dihedral
-        # distribution than the pial. See debug_output/mebrains_root_analysis
-        # for the full containment / smoothness comparison.
+        # Root mesh via marching cubes on the T1 template (for MEBRAINS this
+        # means MEBRAINS_T1.nii.gz). The FreeSurfer pial path was removed — it
+        # ships as two open shells with a midline gap that medial parcellation
+        # labels fall through. See atlas_meshes_and_volumes.md.
         no_mesh = generate_meshes(
             config["nifti"], meshes_dir, id_to_structure,
             template_nifti=config.get("template_nifti"),
-            root_pial_surfaces=None,
         )
 
     # DANDI data

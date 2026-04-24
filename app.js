@@ -585,13 +585,15 @@ function onMouseMove(event) {
       highlightMesh(sid);
     }
 
-    // Update tooltip. For root, use the aggregate counts (total across all
-    // descendants) since root itself has 0 direct annotations.
+    // Update tooltip. Use the aggregate (total across descendants) counts —
+    // intermediate nodes like "Motor cortex" have 0 direct annotations but
+    // non-zero descendant counts, and showing "0 dandisets" there would be
+    // misleading. Leaf regions have total == direct so the value is the same.
+    // Matches how the tree badge renders totals via renderBadge.
     const region = dandiRegions[String(sid)];
     if (region) {
-      const isRoot = hit.userData.isRoot;
-      const dsCount = isRoot ? (region.total_dandiset_count || 0) : region.dandiset_count;
-      const fileCount = isRoot ? (region.total_file_count || 0) : region.file_count;
+      const dsCount = region.total_dandiset_count ?? region.dandiset_count ?? 0;
+      const fileCount = region.total_file_count ?? region.file_count ?? 0;
       tooltip.classList.remove('hidden');
       tooltip.innerHTML = `
         <div class="tooltip-name">${region.name}</div>
