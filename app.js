@@ -30,6 +30,16 @@ let dandisetRegionFilter = null; // structure_id when filtering subjects by regi
 let dandisetSubjectCounts = null; // { directSubjects, totalSubjects } when a dandiset is selected
 let hiddenRegionIds = new Set();  // regions toggled off by user in dandiset/subject view
 let dandisetsWithElectrodes = new Set();  // dandiset IDs that have electrode coordinate data
+const SESSION_ELECTRODE_COLORS = [
+  'ff4466',
+  '4dd6ff',
+  'ffd166',
+  '8aff80',
+  'c084fc',
+  'ff9f43',
+  '00d1b2',
+  'f78fb3',
+];
 
 // ── Initialization ─────────────────────────────────────────────────────────
 async function init() {
@@ -180,6 +190,7 @@ function setupScene() {
 
   // Raycaster for picking
   raycaster = new THREE.Raycaster();
+  raycaster.params.Points.threshold = 180;
   mouse = new THREE.Vector2();
 
   // Events
@@ -333,17 +344,43 @@ function onMouseMove(event) {
   mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
 
   raycaster.setFromCamera(mouse, camera);
+  const tooltip = document.getElementById('tooltip');
+
+  if (electrodePoints?.parent) {
+    const electrodeHits = raycaster.intersectObject(electrodePoints, false);
+    if (electrodeHits.length > 0) {
+      if (hoveredId !== null) {
+        unhighlightMesh(hoveredId);
+        hoveredId = null;
+      }
+
+      const hit = electrodeHits[0];
+      const point = electrodePoints.userData.pointInfo?.[hit.index];
+      if (point) {
+        tooltip.classList.remove('hidden');
+        tooltip.innerHTML = `
+          <div class="tooltip-name">Electrode ${point.index + 1}</div>
+          <div class="tooltip-acronym">${escapeHtml(point.sessionLabel)}</div>
+          <div class="tooltip-info">${escapeHtml(point.subjectLabel)} &middot; ${escapeHtml(point.assetLabel)}</div>
+          <div class="tooltip-info">CCF: ${formatCoord(point.coord[0])}, ${formatCoord(point.coord[1])}, ${formatCoord(point.coord[2])}</div>
+        `;
+        tooltip.style.left = (event.clientX - rect.left + 15) + 'px';
+        tooltip.style.top = (event.clientY - rect.top + 15) + 'px';
+        renderer.domElement.style.cursor = 'crosshair';
+        return;
+      }
+    }
+  }
 
   // Only pick visible data meshes
   const pickable = Object.values(meshObjects).filter(
     m => m.userData.isData && m.visible
   );
   const intersects = raycaster.intersectObjects(pickable, false);
+  const brainHit = pickBrainRegionHit(intersects);
 
-  const tooltip = document.getElementById('tooltip');
-
-  if (intersects.length > 0) {
-    const hit = intersects[0].object;
+  if (brainHit) {
+    const hit = brainHit.object;
     const sid = hit.userData.structureId;
 
     if (hoveredId !== sid) {
@@ -408,15 +445,34 @@ function onClick(event) {
 
   const pickable = Object.values(meshObjects).filter(m => m.userData.isData && m.visible);
   const intersects = raycaster.intersectObjects(pickable, false);
+  const brainHit = pickBrainRegionHit(intersects);
 
-  if (intersects.length > 0) {
-    const sid = intersects[0].object.userData.structureId;
+  if (brainHit) {
+    const sid = brainHit.object.userData.structureId;
     if (selectedDandiset) {
       filterDandisetPanelByRegion(sid);
     } else {
       selectRegion(sid);
     }
   }
+}
+
+function pickBrainRegionHit(intersects) {
+  if (intersects.length === 0) return null;
+  return intersects.find(hit => hit.object.userData.structureId !== meshManifest.root_id) || intersects[0];
+}
+
+function escapeHtml(value) {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function formatCoord(value) {
+  return Number.isInteger(value) ? value.toString() : Number(value).toFixed(1);
 }
 
 function getDescendantIds(structureId) {
@@ -917,9 +973,20 @@ async function updateDandisetPanel(dandisetId, structureIds) {
         const isMultiSession = entry.assets.length > 1;
 
         if (isMultiSession) {
+          const sessionKeys = [...new Set(entry.assets.map(a => a.session || a.path))];
+          const electrodeAssets = entry.assets.map(a => {
+            const sessionKey = a.session || a.path;
+            return {
+              id: a.asset_id,
+              label: a.session ? `ses-${a.session}` : a.path.split('/').pop(),
+              sessionKey,
+              color: SESSION_ELECTRODE_COLORS[sessionKeys.indexOf(sessionKey) % SESSION_ELECTRODE_COLORS.length],
+            };
+          });
+
           // Expandable subject card with session rows
           html += `<div class="subject-group">`;
-          html += `<div class="asset-card subject-card-expandable" data-region-ids='${regionIds}' data-subject-dir="${entry.subjectDir}">`;
+          html += `<div class="asset-card subject-card-expandable" data-region-ids='${regionIds}' data-electrode-assets='${JSON.stringify(electrodeAssets)}' data-subject-dir="${entry.subjectDir}">`;
           if (hasAnyElectrodes) html += `<span class="electrode-indicator" title="Has electrode coordinates"></span>`;
           html += `<span class="expand-arrow">&#x25B6;</span>`;
           html += `<span class="asset-card-filename">${subjectId}</span>`;
@@ -948,7 +1015,11 @@ async function updateDandisetPanel(dandisetId, structureIds) {
             const sessionHasElectrodes = electrodeData[asset.asset_id]?.length > 0;
             const tooltip = `Session: ${sessionLabel || 'unknown'}\nPath: ${asset.path}\nAsset ID: ${asset.asset_id}`;
             html += `<div class="session-row" title="${tooltip.replace(/"/g, '&quot;')}" data-asset-id="${asset.asset_id}" data-region-ids='${assetRegionIds}' data-subject-dir="${entry.subjectDir}">`;
-            if (sessionHasElectrodes) html += `<span class="electrode-indicator" title="Has electrode coordinates"></span>`;
+            if (sessionHasElectrodes) {
+              const sessionKey = asset.session || asset.path;
+              const color = SESSION_ELECTRODE_COLORS[sessionKeys.indexOf(sessionKey) % SESSION_ELECTRODE_COLORS.length];
+              html += `<span class="electrode-indicator" title="Has electrode coordinates" style="background:#${color}; box-shadow:0 0 4px #${color}99"></span>`;
+            }
             html += `<span class="session-row-label">${label}</span>`;
             html += `<span class="asset-card-region-count">${asset.regions.length} region${asset.regions.length !== 1 ? 's' : ''}</span>`;
             html += `</div>`;
@@ -1000,6 +1071,27 @@ async function updateDandisetPanel(dandisetId, structureIds) {
           sessionList.classList.remove('hidden');
           arrow.classList.add('expanded');
         }
+
+        const regionIds = JSON.parse(card.dataset.regionIds || '[]');
+        const electrodeAssets = JSON.parse(card.dataset.electrodeAssets || '[]');
+        const subjectDir = card.dataset.subjectDir;
+        const subjectName = card.querySelector('.asset-card-filename')?.textContent || subjectDir.replace(/^sub-/, '');
+
+        dandisetRegionFilter = null;
+        filterTreeByStructureIds(regionIds);
+        showSubjectFilter(`Subject: ${subjectName}`);
+        const selEl = document.querySelector('.tree-node-content.selected');
+        if (selEl) selEl.classList.remove('selected');
+
+        showElectrodePointsForAssets(dandisetId, electrodeAssets, { colorBySession: true });
+        setHash(`dandiset=${dandisetId}&subject=${subjectDir}`);
+
+        isolateStructureIds(regionIds);
+        filterRegionToggles(regionIds);
+
+        panel.querySelectorAll('.asset-card').forEach(c => c.classList.remove('asset-card-selected'));
+        panel.querySelectorAll('.session-row').forEach(r => r.classList.remove('session-row-selected'));
+        card.classList.add('asset-card-selected');
       });
     });
 
@@ -1337,10 +1429,50 @@ async function fetchElectrodes(dandisetId) {
 }
 
 async function showElectrodePoints(dandisetId, assetId) {
+  return showElectrodePointsForAssets(dandisetId, [assetId]);
+}
+
+async function showElectrodePointsForAssets(dandisetId, assetRefs, { colorBySession = false } = {}) {
   clearElectrodePoints();
   const assetCoords = await fetchElectrodes(dandisetId);
   if (!assetCoords) return;
-  const coords = assetCoords[assetId];
+
+  const subjectLabel = document.getElementById('subject-filter-label')?.textContent || `Dandiset ${dandisetId}`;
+  const assets = assetRefs.map(ref => (
+    typeof ref === 'string'
+      ? { id: ref, label: 'Selected session', sessionKey: ref, color: 'ff4466' }
+      : ref
+  ));
+  const coords = [];
+  const colors = [];
+  const pointInfo = [];
+  for (const asset of assets) {
+    const assetPoints = assetCoords[asset.id];
+    if (!assetPoints?.length) continue;
+    const validPoints = assetPoints.filter(coord => !isZeroCoordinate(coord));
+    if (validPoints.length === 0) continue;
+
+    const startIndex = coords.length;
+    coords.push(...validPoints);
+    const sessionLabel = asset.label || asset.sessionKey || 'Session';
+    const assetLabel = `Asset ${asset.id.slice(0, 8)}`;
+    for (let i = 0; i < validPoints.length; i++) {
+      pointInfo.push({
+        index: startIndex + i,
+        sessionLabel,
+        subjectLabel,
+        assetLabel,
+        coord: validPoints[i],
+      });
+    }
+
+    if (colorBySession) {
+      const color = new THREE.Color(`#${asset.color || 'ff4466'}`);
+      for (let i = 0; i < validPoints.length; i++) {
+        colors.push(color.r, color.g, color.b);
+      }
+    }
+  }
   if (!coords || coords.length === 0) return;
 
   // Detect coordinate unit: Allen CCF is in micrometers (max ~13200).
@@ -1362,19 +1494,31 @@ async function showElectrodePoints(dandisetId, assetId) {
     positions[i * 3 + 2] = coords[i][2] * scale;
   }
   geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  if (colorBySession && colors.length === coords.length * 3) {
+    geometry.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+  }
 
   const alphaSlider = document.getElementById('electrode-alpha');
   const material = new THREE.PointsMaterial({
     color: 0xff4466,
     size: 150,
     sizeAttenuation: true,
+    vertexColors: colorBySession,
     transparent: true,
     opacity: parseFloat(alphaSlider.value),
   });
 
   electrodePoints = new THREE.Points(geometry, material);
+  electrodePoints.userData.pointInfo = pointInfo;
   scene.add(electrodePoints);
   document.getElementById('electrode-control-row').classList.remove('hidden');
+}
+
+function isZeroCoordinate(coord) {
+  return coord?.length >= 3 && (
+    (coord[0] === 0 && coord[1] === 0 && coord[2] === 0) ||
+    (coord[0] === -1 && coord[1] === -1 && coord[2] === -1)
+  );
 }
 
 function clearElectrodePoints() {
@@ -1943,12 +2087,7 @@ async function applyHashState() {
   }
 
   const params = Object.fromEntries(hash.split('&').map(p => p.split('=')));
-  if (params.region) {
-    const sid = parseInt(params.region);
-    if (idToStructure[sid]) {
-      selectRegion(sid, { expandTree: true, pushState: false });
-    }
-  } else if (params.dandiset) {
+  if (params.dandiset) {
     const did = params.dandiset;
     if (dandisetToStructures[did]) {
       await selectDandiset(did, { pushState: false });
@@ -1961,6 +2100,11 @@ async function applyHashState() {
       if (params.subject) {
         selectSubjectByDir(did, params.subject, params.session || null);
       }
+    }
+  } else if (params.region) {
+    const sid = parseInt(params.region);
+    if (idToStructure[sid]) {
+      selectRegion(sid, { expandTree: true, pushState: false });
     }
   }
 }
