@@ -217,11 +217,15 @@ async function loadAtlas(atlasKey) {
   updateLoadingText('Loading brain meshes...');
   await loadInitialMeshes();
 
-  hideLoading();
-
-  // Select root
+  // Select root BEFORE hiding the loading overlay so the user never sees
+  // the undimmed "speckled brain" state between the last mesh load and
+  // applyIsolation. Late-arriving ancestor meshes (triggered by
+  // isolateRegion's own toLoad queue) dim themselves via loadMesh's
+  // post-add isolation check.
   const rootNode = structureGraph[0];
   if (rootNode) selectRegion(rootNode.id, { expandTree: true, pushState: false });
+
+  hideLoading();
 
   // Fetch dandiset titles in background
   fetchDandisetTitles();
@@ -512,10 +516,21 @@ function loadMesh(structureId) {
         scene.add(mesh);
         meshObjects[structureId] = mesh;
 
-        // If a region or dandiset is already selected, hide this new mesh unless it's part of the selection
+        // When meshes load asynchronously mid-selection, apply the same
+        // isolation treatment applyIsolation would have applied so late
+        // arrivals don't flash in visible. getDescendantIds(selectedId)
+        // contains the whole tree when root is selected, so the old
+        // activeIds-miss check never fired there — that produced the
+        // speckled-brain bug when switching atlases on slow connections.
         if (selectedId !== null) {
-          const activeIds = getDescendantIds(selectedId);
-          if (!activeIds.has(structureId) && structureId !== meshManifest.root_id) {
+          const isAllen = activeAtlas.coordSystem === 'allen';
+          const isRoot = structureId === meshManifest.root_id;
+          if (structureId === selectedId) {
+            if (isRoot && isAllen) restoreOriginal(mesh);
+            else applyActive(mesh);
+          } else if (isRoot && isAllen) {
+            restoreOriginal(mesh);
+          } else {
             applyDimmed(mesh);
           }
         } else if (selectedDandiset !== null) {
@@ -1865,7 +1880,6 @@ async function showElectrodePointsForAssets(dandisetId, assetRefs, { colorBySess
     vertexColors: colorBySession,
     transparent: true,
     opacity: parseFloat(alphaSlider.value),
-    depthTest: false,
   });
 
   electrodePoints = new THREE.Points(geometry, material);
