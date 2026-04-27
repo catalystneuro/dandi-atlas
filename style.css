@@ -1025,11 +1025,11 @@ body {
   width: 80px;
 }
 
-#region-alpha {
+#region-opacity {
   accent-color: var(--accent);
 }
 
-#electrode-alpha {
+#electrode-opacity {
   accent-color: #ff4466;
 }
 

@@ -150,14 +150,14 @@ let dandisetAssets = {};        // dandiset_id -> [{path, asset_id, regions}]
 let selectedDandiset = null;
 let dandisetElectrodes = {};  // cache: dandiset_id -> {asset_id: [[x,y,z], ...]}
 let electrodePoints = null;   // THREE.Points object
-let regionSliderOpacityValue = 1;          // mirrors the Regions slider value (range 0-1)
-let electrodeSliderOpacityValue = 1;       // mirrors the Electrodes slider value (range 0-1)
+let sliderRegionOpacity = 1;          // mirrors the Regions slider value (range 0-1)
+let sliderElectrodeOpacity = 1;       // mirrors the Electrodes slider value (range 0-1)
 
 // Default Regions slider value when entering a view that displays electrodes.
 // Auto-applied in showElectrodePointsForAssets so electrodes inside the active
 // region aren't occluded by it. User can re-raise after; the auto-drop only
 // fires when the slider was higher than this value.
-const ELECTRODE_VIEW_DEFAULT_REGION_ALPHA = 0.5;
+const ELECTRODE_VIEW_DEFAULT_REGION_OPACITY = 0.5;
 let dandisetRegionFilter = null; // structure_id when filtering subjects by region within a dandiset
 let dandisetSubjectCounts = null; // { directSubjects, totalSubjects } when a dandiset is selected
 let hiddenRegionIds = new Set();  // regions toggled off by user in dandiset/subject view
@@ -775,7 +775,7 @@ function getDescendantIds(structureId) {
 //
 // - treatMesh(mesh, treatment): the single mutator. Given a treatment name,
 //   sets all relevant material/visibility/depth properties, derived from the
-//   current regionSliderOpacityValue and atlas. Every code path that mutates a mesh's
+//   current sliderRegionOpacity and atlas. Every code path that mutates a mesh's
 //   visual state goes through this function — there is no other place that
 //   knows about depthWrite, transparent, etc. This prevents the class of bug
 //   where one call site (e.g. the slider handler) updates opacity but forgets
@@ -841,7 +841,7 @@ function decideTreatment(meshId, activeIds) {
 }
 
 // Single mutator. Apply a treatment to a mesh, deriving all properties from
-// current regionSliderOpacityValue and atlas. Sets mesh.userData.treatment so callers that
+// current sliderRegionOpacity and atlas. Sets mesh.userData.treatment so callers that
 // re-apply (slider handler) can read back the current treatment.
 function treatMesh(mesh, treatment) {
   const orig = mesh.userData.originalMaterial;
@@ -850,13 +850,13 @@ function treatMesh(mesh, treatment) {
   const isRoot = mesh.userData.isRoot;
 
   if (treatment === 'active') {
-    if (regionSliderOpacityValue === 0) {
+    if (sliderRegionOpacity === 0) {
       mesh.visible = false;
     } else {
       const mat = orig.clone();
-      mat.opacity = regionSliderOpacityValue;
-      mat.transparent = regionSliderOpacityValue < 1;
-      mat.depthWrite = regionSliderOpacityValue >= 1;
+      mat.opacity = sliderRegionOpacity;
+      mat.transparent = sliderRegionOpacity < 1;
+      mat.depthWrite = sliderRegionOpacity >= 1;
       if (isRoot && !isAllen) {
         // Macaque root coming out of fresnel mode: reset state the
         // outline material left on the mesh so root renders as a solid brain.
@@ -869,11 +869,11 @@ function treatMesh(mesh, treatment) {
     }
   } else if (treatment === 'glass') {
     // Allen root only: original (translucent) material at slider-modulated alpha.
-    if (regionSliderOpacityValue === 0) {
+    if (sliderRegionOpacity === 0) {
       mesh.visible = false;
     } else {
       const mat = orig.clone();
-      mat.opacity = orig.opacity * regionSliderOpacityValue;
+      mat.opacity = orig.opacity * sliderRegionOpacity;
       mat.transparent = mat.opacity < 1;
       mat.needsUpdate = true;
       mesh.material = mat;
@@ -1161,45 +1161,61 @@ function filterTreeByDandiset(dandisetId) {
   });
 }
 
-function clearDandisetFilter() {
-  // Hide filter bars
-  document.getElementById('dandiset-filter-bar').classList.add('hidden');
-  hideSubjectFilter();
-  clearElectrodePoints();
+// Reset selection state, DOM overlays, and the 3D scene back to the atlas-init
+// look. Shared by every code path that returns the user to the "no selection"
+// state: the dandiset-filter clear button (clearDandisetFilter) and the
+// no-hash branch of applyHashState (popstate / external hash clear).
+//
+// Does NOT touch the URL hash — callers decide whether to push a clean URL
+// (clearDandisetFilter does; applyHashState is reacting to a hash that's
+// already empty).
+//
+// The Allen vs macaque 3D-view split is intentional: showAllRegions restores
+// Allen's "frosted brain" look but on macaque would leak previously loaded
+// region meshes, so macaque routes through selectRegion(root) so only root
+// is visible.
+function restoreInitView() {
+  // Selection state
+  selectedId = null;
+  selectedDandiset = null;
   dandisetRegionFilter = null;
+  dandisetSubjectCounts = null;
   hiddenRegionIds = new Set();
+  currentView = 'init';
+
+  // Scene-side overlays
+  clearElectrodePoints();
   document.getElementById('region-toggles-overlay').classList.add('hidden');
 
-  // Remove dandiset filter classes from all tree nodes
-  const container = document.getElementById('hierarchy-tree');
-  container.querySelectorAll('.dandiset-inactive').forEach(el => {
-    el.classList.remove('dandiset-inactive');
-  });
-  container.querySelectorAll('.dandiset-active').forEach(el => {
-    el.classList.remove('dandiset-active');
-  });
+  // Filter bars
+  document.getElementById('dandiset-filter-bar').classList.add('hidden');
+  hideSubjectFilter();
 
-  // Restore 3D view to init state. Allen keeps showAllRegions (restores the
-  // wireframe-context frosted-brain init look); macaque routes through
-  // selectRegion(root) so only root is visible.
-  selectedDandiset = null;
-  selectedId = null;
-  dandisetSubjectCounts = null;
+  // Tree: deselect any selected node, strip dandiset filter classes
+  const tree = document.getElementById('hierarchy-tree');
+  const sel = tree.querySelector('.tree-node-content.selected');
+  if (sel) sel.classList.remove('selected');
+  tree.querySelectorAll('.dandiset-inactive').forEach(el => el.classList.remove('dandiset-inactive'));
+  tree.querySelectorAll('.dandiset-active').forEach(el => el.classList.remove('dandiset-active'));
+
+  // 3D scene
   if (activeAtlas.coordSystem === 'allen') {
     showAllRegions();
   } else if (meshManifest && meshManifest.root_id != null) {
     selectRegion(meshManifest.root_id, { pushState: false, expandTree: false });
   }
 
-  // Clear URL hash
-  history.pushState(null, '', window.location.pathname);
-
-  // Restore tree badges to dandiset counts
+  // Tree badges back to dandiset counts (subject-count mode is dandiset-scoped)
   updateTreeBadges();
 
-  // Reset right panel
+  // Right panel placeholder
   document.getElementById('region-panel').innerHTML =
     '<p class="placeholder-text">Click a brain region to view details and associated DANDI datasets.</p>';
+}
+
+function clearDandisetFilter() {
+  restoreInitView();
+  history.pushState(null, '', window.location.pathname);
 }
 
 function filterDandisetPanelByRegion(structureId, { pushState = true } = {}) {
@@ -1920,7 +1936,7 @@ async function showElectrodePointsForAssets(dandisetId, assetRefs, { colorBySess
     sizeAttenuation: true,
     vertexColors: colorBySession,
     transparent: true,
-    opacity: electrodeSliderOpacityValue,
+    opacity: sliderElectrodeOpacity,
   });
 
   electrodePoints = new THREE.Points(geometry, material);
@@ -1934,9 +1950,9 @@ async function showElectrodePointsForAssets(dandisetId, assetRefs, { colorBySess
   // had set the slider lower already. Triggered here (rather than at view
   // transitions) because this is the precise moment electrodes become
   // visible; views without electrode data don't need the auto-drop.
-  const regionSlider = document.getElementById('region-alpha');
-  if (regionSlider && parseFloat(regionSlider.value) > ELECTRODE_VIEW_DEFAULT_REGION_ALPHA) {
-    regionSlider.value = ELECTRODE_VIEW_DEFAULT_REGION_ALPHA;
+  const regionSlider = document.getElementById('region-opacity');
+  if (regionSlider && parseFloat(regionSlider.value) > ELECTRODE_VIEW_DEFAULT_REGION_OPACITY) {
+    regionSlider.value = ELECTRODE_VIEW_DEFAULT_REGION_OPACITY;
     regionSlider.dispatchEvent(new Event('input', { bubbles: true }));
   }
 }
@@ -2450,25 +2466,25 @@ function setupResize() {
 setupResize();
 
 // ── Alpha Sliders ───────────────────────────────────────────────────────────
-document.getElementById('electrode-alpha').addEventListener('input', (e) => {
-  electrodeSliderOpacityValue = parseFloat(e.target.value);
+document.getElementById('electrode-opacity').addEventListener('input', (e) => {
+  sliderElectrodeOpacity = parseFloat(e.target.value);
   if (electrodePoints) {
-    if (electrodeSliderOpacityValue === 0) {
+    if (sliderElectrodeOpacity === 0) {
       scene.remove(electrodePoints);
     } else {
       if (!electrodePoints.parent) scene.add(electrodePoints);
-      electrodePoints.material.opacity = electrodeSliderOpacityValue;
+      electrodePoints.material.opacity = sliderElectrodeOpacity;
     }
   }
 });
 
-document.getElementById('region-alpha').addEventListener('input', (e) => {
-  regionSliderOpacityValue = parseFloat(e.target.value);
-  // Re-apply each mesh's CURRENT treatment using the new regionSliderOpacityValue. The
+document.getElementById('region-opacity').addEventListener('input', (e) => {
+  sliderRegionOpacity = parseFloat(e.target.value);
+  // Re-apply each mesh's CURRENT treatment using the new sliderRegionOpacity. The
   // slider doesn't decide policy (that's decideTreatment's job, run once
   // when the selection changes); it just refreshes whatever role each mesh
   // is already playing. treatMesh derives all property values (opacity,
-  // transparent, depthWrite, visible) from the new regionSliderOpacityValue, so the
+  // transparent, depthWrite, visible) from the new sliderRegionOpacity, so the
   // slider can never leave a mesh in an inconsistent state.
   for (const mesh of Object.values(meshObjects)) {
     if (mesh.userData.treatment) {
@@ -2514,35 +2530,10 @@ function setHash(hash) {
 async function applyHashState() {
   const hash = location.hash.slice(1); // remove '#'
   if (!hash) {
-    // No hash — show default (init) view.
+    // No hash — show default (init) view. Guard avoids redundant DOM thrash
+    // when a hashchange fires but nothing is actually selected.
     if (selectedId !== null || selectedDandiset !== null) {
-      selectedId = null;
-      selectedDandiset = null;
-      dandisetSubjectCounts = null;
-      hiddenRegionIds = new Set();
-      currentView = 'init';
-      document.getElementById('region-toggles-overlay').classList.add('hidden');
-      clearElectrodePoints();
-      const prevEl = document.querySelector('.tree-node-content.selected');
-      if (prevEl) prevEl.classList.remove('selected');
-      // Allen: restore all loaded data-region meshes to their original
-      // wireframe-context opacity (the "frosted brain" init look).
-      // Macaque: route through selectRegion(root) so only root is visible,
-      // matching startup. showAllRegions on macaque would leak previously
-      // loaded region meshes into the init view.
-      if (activeAtlas.coordSystem === 'allen') {
-        showAllRegions();
-      } else if (meshManifest && meshManifest.root_id != null) {
-        selectRegion(meshManifest.root_id, { pushState: false, expandTree: false });
-      }
-      updateTreeBadges();
-      // Clear dandiset filter bar
-      document.getElementById('dandiset-filter-bar').classList.add('hidden');
-      const tree = document.getElementById('hierarchy-tree');
-      tree.querySelectorAll('.dandiset-inactive').forEach(el => el.classList.remove('dandiset-inactive'));
-      tree.querySelectorAll('.dandiset-active').forEach(el => el.classList.remove('dandiset-active'));
-      document.getElementById('region-panel').innerHTML =
-        '<p class="placeholder-text">Click a brain region to view details and associated DANDI datasets.</p>';
+      restoreInitView();
     }
     return;
   }
