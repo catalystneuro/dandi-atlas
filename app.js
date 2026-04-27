@@ -13,7 +13,102 @@ let selectedId = null;
 let hoveredId = null;
 let loadingCount = 0;
 let brainCenter = new THREE.Vector3();
-const CAM_DIST = 18000;
+
+// ── Helpers ────────────────────────────────────────────────────────────────
+function recreateOrbitControls(target) {
+  if (controls) controls.dispose();
+  controls = new OrbitControls(camera, renderer.domElement);
+  controls.enableDamping = true;
+  controls.dampingFactor = 0.1;
+  controls.rotateSpeed = 0.8;
+  controls.zoomSpeed = 1.2;
+  if (target) {
+    controls.target.copy(target);
+    controls.update();
+  }
+}
+
+// ── Atlas Configuration ────────────────────────────────────────────────────
+const ATLAS_CONFIGS = {
+  allen_ccf: {
+    name: "Allen CCF (Mouse)",
+    dataPrefix: "data/atlases/allen_ccf/",
+    camDist: 18000,
+    cameraUp: [0, -1, 0],
+    camOffset: [0, 0, 1],  // Z=Right in PIR, lateral view
+    nearPlane: 1,
+    farPlane: 100000,
+    electrodeSize: 150,
+    electrodePickThreshold: 180,
+    rootOpacity: 0.06,
+    coordSystem: 'allen',
+    attribution: 'Atlas: Allen Institute CCF',
+    attributionUrl: 'https://atlas.brain-map.org/',
+    regionLinkTemplate: 'https://atlas.brain-map.org/atlas#atlas=2&structure={id}',
+  },
+  d99: {
+    name: "D99 v2.0 (Macaque)",
+    dataPrefix: "data/atlases/d99/",
+    camDist: 200,
+    cameraUp: [0, 0, 1],
+    camOffset: [1, 0, 0],  // X=Right in RAS, lateral view
+    nearPlane: 0.1,
+    farPlane: 1000,
+    electrodeSize: 3,
+    electrodePickThreshold: 4,
+    rootOpacity: 0.3,
+    coordSystem: 'ras',
+    attribution: 'Atlas: D99 v2 (Saleem & Logothetis)',
+    attributionUrl: 'https://afni.nimh.nih.gov/pub/dist/doc/htmldoc/nonhuman/macaque_tempatl/atlas_d99v2.html',
+    regionLinkTemplate: null,
+  },
+  nmt: {
+    name: "NMT v2.0 sym (Macaque)",
+    dataPrefix: "data/atlases/nmt/",
+    camDist: 200,
+    cameraUp: [0, 0, 1],
+    camOffset: [1, 0, 0],  // X=Right in RAS, lateral view
+    nearPlane: 0.1,
+    farPlane: 1000,
+    electrodeSize: 3,
+    electrodePickThreshold: 4,
+    rootOpacity: 0.3,
+    coordSystem: 'ras',
+    attribution: 'Atlas: NMT v2 (Jung et al. 2021)',
+    attributionUrl: 'https://afni.nimh.nih.gov/pub/dist/doc/htmldoc/nonhuman/macaque_tempatl/template_nmtv2.html',
+    regionLinkTemplate: null,
+  },
+  mebrains: {
+    name: "MEBRAINS (Macaque)",
+    dataPrefix: "data/atlases/mebrains/",
+    camDist: 200,
+    cameraUp: [0, 0, 1],
+    camOffset: [1, 0, 0],  // X=Right in RAS, lateral view
+    nearPlane: 0.1,
+    farPlane: 1000,
+    electrodeSize: 3,
+    electrodePickThreshold: 4,
+    rootOpacity: 0.25,
+    coordSystem: 'ras',
+    attribution: 'Atlas: MEBRAINS (EBRAINS)',
+    attributionUrl: 'https://ebrains.eu/tools/mebrains',
+    regionLinkTemplate: null,
+  },
+};
+
+// Short label shown before electrode coordinates in the hover tooltip.
+// Each atlas has its own coordinate frame (Allen uses CCF µm in PIR;
+// macaque atlases use native RAS mm), so the tooltip should not lie by
+// calling everything "CCF".
+const ATLAS_COORD_LABELS = {
+  allen_ccf: 'CCF',
+  d99: 'D99',
+  nmt: 'NMT',
+  mebrains: 'MEBRAINS',
+};
+
+let activeAtlasKey = 'allen_ccf';
+let activeAtlas = ATLAS_CONFIGS.allen_ccf;
 
 // Sets for quick lookups
 let dataStructureIds = new Set();
@@ -41,31 +136,52 @@ const SESSION_ELECTRODE_COLORS = [
   'f78fb3',
 ];
 
-// ── Initialization ─────────────────────────────────────────────────────────
-async function init() {
+// ── Atlas Loading ──────────────────────────────────────────────────────────
+async function loadAtlas(atlasKey) {
+  activeAtlasKey = atlasKey;
+  activeAtlas = ATLAS_CONFIGS[atlasKey];
+
+  // Re-tune the electrode picking tolerance for the new atlas's world scale
+  // (µm vs mm). Without this the old threshold carries over and hovers pick
+  // incorrectly on the new atlas.
+  if (raycaster) raycaster.params.Points.threshold = activeAtlas.electrodePickThreshold;
+
+  showLoading();
   updateLoadingText('Fetching data...');
 
-  const [graphResp, regionsResp, manifestResp, assetsResp, lastUpdatedResp, electrodeManifestResp] = await Promise.all([
-    fetch('data/structure_graph.json').then(r => r.json()),
-    fetch('data/dandi_regions.json').then(r => r.json()),
-    fetch('data/mesh_manifest.json').then(r => r.json()),
-    fetch('data/dandiset_assets.json').then(r => r.json()),
-    fetch('data/last_updated.json').then(r => r.json()).catch(() => null),
-    fetch('data/dandisets_with_electrodes.json').then(r => r.json()).catch(() => []),
+  // Clear existing state
+  clearElectrodePoints();
+  selectedId = null;
+  hoveredId = null;
+  selectedDandiset = null;
+  dandisetElectrodes = {};
+  dandisetRegionFilter = null;
+  dandisetSubjectCounts = null;
+  hiddenRegionIds = new Set();
+  idToStructure = {};
+  dandisetToStructures = {};
+
+  // Remove existing meshes from scene
+  for (const [id, mesh] of Object.entries(meshObjects)) {
+    scene.remove(mesh);
+    mesh.geometry.dispose();
+    if (mesh.material.dispose) mesh.material.dispose();
+  }
+  meshObjects = {};
+  failedMeshIds.clear();
+
+  const [graphResp, regionsResp, manifestResp, assetsResp, electrodeManifestResp] = await Promise.all([
+    fetch(`${activeAtlas.dataPrefix}structure_graph.json`).then(r => r.json()),
+    fetch(`${activeAtlas.dataPrefix}dandi_regions.json`).then(r => r.json()),
+    fetch(`${activeAtlas.dataPrefix}mesh_manifest.json`).then(r => r.json()),
+    fetch(`${activeAtlas.dataPrefix}dandiset_assets.json`).then(r => r.json()),
+    fetch(`${activeAtlas.dataPrefix}dandisets_with_electrodes.json`).then(r => r.json()).catch(() => []),
   ]);
 
   structureGraph = graphResp;
   dandiRegions = regionsResp;
   meshManifest = manifestResp;
   dandisetAssets = assetsResp;
-
-  // Show last-updated timestamp
-  if (lastUpdatedResp && lastUpdatedResp.timestamp) {
-    const date = new Date(lastUpdatedResp.timestamp);
-    const formatted = date.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
-    const el = document.getElementById('last-updated');
-    if (el) el.textContent = `Data updated ${formatted}`;
-  }
 
   dandisetsWithElectrodes = new Set(electrodeManifestResp);
   dataStructureIds = new Set(meshManifest.data_structures);
@@ -83,28 +199,98 @@ async function init() {
     }
   }
 
-  updateLoadingText('Setting up 3D scene...');
-  setupScene();
+  // Reconfigure camera for this atlas
+  camera.near = activeAtlas.nearPlane;
+  camera.far = activeAtlas.farPlane;
+  camera.up.set(...activeAtlas.cameraUp);
+  camera.updateProjectionMatrix();
+
+  // Update attribution
+  const attrEl = document.querySelector('.ccf-attribution');
+  if (attrEl) {
+    attrEl.textContent = activeAtlas.attribution;
+    attrEl.href = activeAtlas.attributionUrl;
+  }
+
   buildHierarchyTree();
-  setupSearch();
 
   updateLoadingText('Loading brain meshes...');
   await loadInitialMeshes();
 
+  // Select root BEFORE hiding the loading overlay so the user never sees
+  // the undimmed "speckled brain" state between the last mesh load and
+  // applyMeshTreatments. Late-arriving ancestor meshes (triggered by
+  // isolateRegion's own toLoad queue) dim themselves via loadMesh's
+  // post-add isolation check.
+  const rootNode = structureGraph[0];
+  if (rootNode) selectRegion(rootNode.id, { expandTree: true, pushState: false });
+
   hideLoading();
+
+  // Fetch dandiset titles in background
+  fetchDandisetTitles();
+}
+
+// ── Initialization ─────────────────────────────────────────────────────────
+async function init() {
+  // Read URL parameter for initial atlas; falls through to module-level default if absent or invalid.
+  const urlParams = new URLSearchParams(window.location.search);
+  const atlasParam = urlParams.get('atlas');
+  if (atlasParam && ATLAS_CONFIGS[atlasParam]) {
+    activeAtlasKey = atlasParam;
+    activeAtlas = ATLAS_CONFIGS[atlasParam];
+  }
+
+  // Set dropdown to match the chosen atlas.
+  const selector = document.getElementById('atlas-selector');
+  if (selector) selector.value = activeAtlasKey;
+
+  // Page-lifetime infrastructure: one-time setup that persists across atlas switches.
+  updateLoadingText('Setting up 3D scene...');
+  setupScene();
+  setupSearch();
   animate();
 
-  // Restore view from URL hash, or default to root selection
-  if (!location.hash.slice(1)) {
-    const rootNode = structureGraph[0];
-    if (rootNode) selectRegion(rootNode.id, { expandTree: true, pushState: false });
-  } else {
-    applyHashState();
-  }
+  // URL navigation listener (browser back/forward, hash edits).
   window.addEventListener('hashchange', () => applyHashState());
 
-  // Fetch dandiset titles in background (non-blocking)
-  fetchDandisetTitles();
+  // Atlas selector change handler.
+  if (selector) {
+    selector.addEventListener('change', (e) => {
+      const newAtlas = e.target.value;
+      if (newAtlas !== activeAtlasKey) {
+        const url = new URL(window.location);
+        url.searchParams.set('atlas', newAtlas);
+        url.hash = '';
+        window.history.replaceState({}, '', url);
+        loadAtlas(newAtlas);
+      }
+    });
+  }
+
+  // Fetch atlas-independent metadata (last-updated timestamp). Fire-and-forget;
+  // not awaited so it doesn't delay the main load path.
+  fetch('data/last_updated.json').then(r => r.json()).catch(() => null).then(resp => {
+    if (resp && resp.timestamp) {
+      const date = new Date(resp.timestamp);
+      const formatted = date.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+      const el = document.getElementById('last-updated');
+      if (el) el.textContent = `Data updated ${formatted}`;
+    }
+  });
+
+  // Delegate atlas data loading to loadAtlas — single source of truth for
+  // fetching atlas JSON, building lookups, loading meshes, and applying the
+  // initial root selection. loadAtlas hides the loading overlay when done.
+  await loadAtlas(activeAtlasKey);
+
+  // Deep-link restore: if the URL has a hash (region/dandiset/session deep
+  // link), override loadAtlas's default root selection. The user briefly sees
+  // the root view between loadAtlas's hideLoading and applyHashState's
+  // selection, but only on deep-link loads — direct page loads end at root.
+  if (location.hash.slice(1)) {
+    applyHashState();
+  }
 }
 
 function flattenTree(nodes) {
@@ -166,17 +352,13 @@ function setupScene() {
   camera = new THREE.PerspectiveCamera(
     45,
     viewer.clientWidth / viewer.clientHeight,
-    1,
-    100000
+    activeAtlas.nearPlane,
+    activeAtlas.farPlane
   );
-  camera.position.set(0, 0, 20000);
-  camera.up.set(0, -1, 0);  // Allen CCF: Y increases ventrally, so flip up
+  camera.position.set(0, 0, activeAtlas.coordSystem === 'allen' ? 20000 : activeAtlas.camDist);
+  camera.up.set(...activeAtlas.cameraUp);
 
-  controls = new OrbitControls(camera, canvas);
-  controls.enableDamping = true;
-  controls.dampingFactor = 0.1;
-  controls.rotateSpeed = 0.8;
-  controls.zoomSpeed = 1.2;
+  recreateOrbitControls();
 
   // Lighting
   const ambient = new THREE.AmbientLight(0xffffff, 0.6);
@@ -188,9 +370,12 @@ function setupScene() {
   dirLight2.position.set(-10000, -5000, -10000);
   scene.add(dirLight2);
 
-  // Raycaster for picking
+  // Raycaster for picking. Points threshold is the world-space distance
+  // tolerance for Three.js to register an electrode as "hit" by the ray,
+  // so it must match the scale of the atlas (µm for Allen, mm for macaque).
+  // The value is read from activeAtlas on each atlas switch in loadAtlas.
   raycaster = new THREE.Raycaster();
-  raycaster.params.Points.threshold = 180;
+  raycaster.params.Points.threshold = activeAtlas.electrodePickThreshold;
   mouse = new THREE.Vector2();
 
   // Events
@@ -218,7 +403,7 @@ function loadMesh(structureId) {
       return;
     }
 
-    const path = `data/meshes/${structureId}.glb`;
+    const path = `${activeAtlas.dataPrefix}meshes/${structureId}.glb`;
     gltfLoader.load(
       path,
       (gltf) => {
@@ -231,7 +416,10 @@ function loadMesh(structureId) {
         // Get color and style based on whether this structure has data
         const isRoot = structureId === meshManifest.root_id;
         const region = dandiRegions[String(structureId)];
-        const hasData = !!region;  // has direct or descendant data
+        // Root is never treated as a data region even if a stale
+        // dandi_regions.json carries a zero-count entry for it — that was
+        // visible in NMT as a "0 dandisets" tooltip on hover of the outline.
+        const hasData = !isRoot && !!region;
         const s = idToStructure[structureId];
 
         let color = 0xaaaaaa;
@@ -246,8 +434,8 @@ function loadMesh(structureId) {
           material = new THREE.MeshPhongMaterial({
             color: 0xcccccc,
             transparent: true,
-            opacity: 0.06,
-            side: THREE.DoubleSide,
+            opacity: activeAtlas.rootOpacity,
+            side: THREE.FrontSide,
             depthWrite: false,
           });
         } else if (hasData) {
@@ -260,13 +448,22 @@ function loadMesh(structureId) {
             opacity,
             side: THREE.DoubleSide,
           });
-        } else {
-          // No data at all — wireframe context
+        } else if (activeAtlas.coordSystem === 'allen') {
+          // CCF: wireframe context (original behavior)
           material = new THREE.MeshPhongMaterial({
             color,
             transparent: true,
             opacity: 0.05,
             wireframe: true,
+            side: THREE.DoubleSide,
+            depthWrite: false,
+          });
+        } else {
+          // Macaque: low-opacity solid for anatomical context
+          material = new THREE.MeshPhongMaterial({
+            color,
+            transparent: true,
+            opacity: 0.15,
             side: THREE.DoubleSide,
             depthWrite: false,
           });
@@ -281,10 +478,21 @@ function loadMesh(structureId) {
         scene.add(mesh);
         meshObjects[structureId] = mesh;
 
-        // If a region or dandiset is already selected, hide this new mesh unless it's part of the selection
+        // When meshes load asynchronously mid-selection, apply the same
+        // isolation treatment applyMeshTreatments would have applied so late
+        // arrivals don't flash in visible. (This is per-mesh logic that
+        // mirrors applyMeshTreatments's per-mesh dispatch but runs only on
+        // the one newly-loaded mesh; could be unified into a shared
+        // treatMesh primitive in a future refactor.)
         if (selectedId !== null) {
-          const activeIds = getDescendantIds(selectedId);
-          if (!activeIds.has(structureId) && structureId !== meshManifest.root_id) {
+          const isAllen = activeAtlas.coordSystem === 'allen';
+          const isRoot = structureId === meshManifest.root_id;
+          if (structureId === selectedId) {
+            if (isRoot && isAllen) restoreOriginal(mesh);
+            else applyActive(mesh);
+          } else if (isRoot && isAllen) {
+            restoreOriginal(mesh);
+          } else {
             applyDimmed(mesh);
           }
         } else if (selectedDandiset !== null) {
@@ -304,7 +512,7 @@ function loadMesh(structureId) {
 
 async function ensureMeshLoaded(structureId) {
   if (meshObjects[structureId]) return meshObjects[structureId];
-  if (failedMeshIds.has(structureId)) return null;
+  if (failedMeshIds.has(structureId) || noMeshIds.has(structureId)) return null;
   return loadMesh(structureId);
 }
 
@@ -312,13 +520,23 @@ async function loadInitialMeshes() {
   // Load root brain outline first
   await loadMesh(meshManifest.root_id);
 
-  // Load top-level structures (depth-1 children)
-  const topLevel = structureGraph.flatMap(root =>
-    (root.children || []).map(c => c.id)
-  );
-
-  // Load data structures in batches
-  const allToLoad = meshManifest.data_structures.filter(id => id !== meshManifest.root_id);
+  // Determine which meshes to load
+  let allToLoad;
+  if (activeAtlas.coordSystem === 'allen') {
+    // CCF: only load data structures (original behavior)
+    allToLoad = meshManifest.data_structures.filter(id => id !== meshManifest.root_id);
+  } else {
+    // Macaque: load every GLB produced by the build so the anatomical tree
+    // is fully populated even when the user navigates to a non-data region.
+    // The list is precomputed into meshManifest.all_meshes by the build
+    // script. We used to scrape the server's HTML directory index at runtime,
+    // but that relies on auto-indexing which Netlify (and most CDNs) don't
+    // serve, so the deployed site was falling back to data_structures only.
+    const allMeshIds = meshManifest.all_meshes || meshManifest.data_structures;
+    allToLoad = allMeshIds.filter(id =>
+      id !== meshManifest.root_id && !noMeshIds.has(id)
+    );
+  }
   const batchSize = 20;
   for (let i = 0; i < allToLoad.length; i += batchSize) {
     const batch = allToLoad.slice(i, i + batchSize);
@@ -330,9 +548,20 @@ async function loadInitialMeshes() {
   if (meshObjects[meshManifest.root_id]) {
     const box = new THREE.Box3().setFromObject(meshObjects[meshManifest.root_id]);
     brainCenter = box.getCenter(new THREE.Vector3());
-    controls.target.copy(brainCenter);
-    camera.position.set(brainCenter.x, brainCenter.y, brainCenter.z + CAM_DIST);
-    controls.update();
+
+    // Position camera along the atlas's offset axis
+    const off = activeAtlas.camOffset;
+    camera.position.set(
+      brainCenter.x + off[0] * activeAtlas.camDist,
+      brainCenter.y + off[1] * activeAtlas.camDist,
+      brainCenter.z + off[2] * activeAtlas.camDist
+    );
+    camera.up.set(...activeAtlas.cameraUp);
+
+    // Always recreate OrbitControls so it caches a fresh quaternion
+    // from the current up vector. Without this, switching atlases
+    // leaves the old atlas's quaternion baked into the controls.
+    recreateOrbitControls(brainCenter);
   }
 }
 
@@ -362,7 +591,7 @@ function onMouseMove(event) {
           <div class="tooltip-name">Electrode ${point.index + 1}</div>
           <div class="tooltip-acronym">${escapeHtml(point.sessionLabel)}</div>
           <div class="tooltip-info">${escapeHtml(point.subjectLabel)} &middot; ${escapeHtml(point.assetLabel)}</div>
-          <div class="tooltip-info">CCF: ${formatCoord(point.coord[0])}, ${formatCoord(point.coord[1])}, ${formatCoord(point.coord[2])}</div>
+          <div class="tooltip-info">${ATLAS_COORD_LABELS[activeAtlasKey] || activeAtlasKey}: ${formatCoord(point.coord[0])}, ${formatCoord(point.coord[1])}, ${formatCoord(point.coord[2])}</div>
         `;
         tooltip.style.left = (event.clientX - rect.left + 15) + 'px';
         tooltip.style.top = (event.clientY - rect.top + 15) + 'px';
@@ -372,11 +601,7 @@ function onMouseMove(event) {
     }
   }
 
-  // Only pick visible data meshes
-  const pickable = Object.values(meshObjects).filter(
-    m => m.userData.isData && m.visible
-  );
-  const intersects = raycaster.intersectObjects(pickable, false);
+  const intersects = raycaster.intersectObjects(getHoverPickables(), false);
   const brainHit = pickBrainRegionHit(intersects);
 
   if (brainHit) {
@@ -390,14 +615,20 @@ function onMouseMove(event) {
       highlightMesh(sid);
     }
 
-    // Update tooltip
+    // Update tooltip. Use the aggregate (total across descendants) counts —
+    // intermediate nodes like "Motor cortex" have 0 direct annotations but
+    // non-zero descendant counts, and showing "0 dandisets" there would be
+    // misleading. Leaf regions have total == direct so the value is the same.
+    // Matches how the tree badge renders totals via renderBadge.
     const region = dandiRegions[String(sid)];
     if (region) {
+      const dsCount = region.total_dandiset_count ?? region.dandiset_count ?? 0;
+      const fileCount = region.total_file_count ?? region.file_count ?? 0;
       tooltip.classList.remove('hidden');
       tooltip.innerHTML = `
         <div class="tooltip-name">${region.name}</div>
         <div class="tooltip-acronym">${region.acronym}</div>
-        <div class="tooltip-info">${region.dandiset_count} dandiset${region.dandiset_count !== 1 ? 's' : ''} &middot; ${region.file_count} files</div>
+        <div class="tooltip-info">${dsCount} dandiset${dsCount !== 1 ? 's' : ''} &middot; ${fileCount} files</div>
       `;
       tooltip.style.left = (event.clientX - renderer.domElement.getBoundingClientRect().left + 15) + 'px';
       tooltip.style.top = (event.clientY - renderer.domElement.getBoundingClientRect().top + 15) + 'px';
@@ -443,8 +674,7 @@ function onClick(event) {
 
   raycaster.setFromCamera(mouse, camera);
 
-  const pickable = Object.values(meshObjects).filter(m => m.userData.isData && m.visible);
-  const intersects = raycaster.intersectObjects(pickable, false);
+  const intersects = raycaster.intersectObjects(getClickPickables(), false);
   const brainHit = pickBrainRegionHit(intersects);
 
   if (brainHit) {
@@ -455,6 +685,23 @@ function onClick(event) {
       selectRegion(sid);
     }
   }
+}
+
+// Hover includes root when it's the solid init-view mesh, so hovering the
+// whole brain at the atlas view surfaces the aggregate tooltip. Root is
+// excluded while dimmed (fresnel silhouette during selection) — the rim is
+// pure context, not a UI target.
+function getHoverPickables() {
+  return Object.values(meshObjects).filter(
+    m => m.visible && (m.userData.isData || (m.userData.isRoot && !m.userData.isDimmed))
+  );
+}
+
+// Click never targets root. Navigation back to the init view goes through
+// the hierarchy tree's root node, not the 3D mesh — giving root a click
+// action would create a large accidental-click surface during camera drags.
+function getClickPickables() {
+  return Object.values(meshObjects).filter(m => m.userData.isData && m.visible);
 }
 
 function pickBrainRegionHit(intersects) {
@@ -487,7 +734,59 @@ function getDescendantIds(structureId) {
 }
 
 function applyDimmed(mesh) {
-  mesh.visible = false;
+  if (activeAtlas.coordSystem === 'allen') {
+    // CCF: hide completely.
+    mesh.visible = false;
+    mesh.userData.isDimmed = true;
+    return;
+  }
+  // Macaque: non-root meshes hide. Root becomes a fresnel-rim silhouette so
+  // the selected region has a spatial context without the "fog" that a
+  // flat-alpha outline produced.
+  if (mesh.userData.isRoot) {
+    if (!mesh.userData.outlineMaterial) {
+      const orig = mesh.userData.originalMaterial;
+      const color = orig.color ? orig.color.clone() : new THREE.Color(0xcccccc);
+      mesh.userData.outlineMaterial = new THREE.ShaderMaterial({
+        uniforms: {
+          uColor: { value: color },
+          uRimPower: { value: 2.5 },
+          uRimStrength: { value: 0.9 },
+        },
+        vertexShader: `
+          varying vec3 vNormal;
+          varying vec3 vViewDir;
+          void main() {
+            vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+            vNormal = normalize(normalMatrix * normal);
+            vViewDir = normalize(-mvPosition.xyz);
+            gl_Position = projectionMatrix * mvPosition;
+          }
+        `,
+        fragmentShader: `
+          uniform vec3 uColor;
+          uniform float uRimPower;
+          uniform float uRimStrength;
+          varying vec3 vNormal;
+          varying vec3 vViewDir;
+          void main() {
+            float facing = abs(dot(normalize(vNormal), vViewDir));
+            float rim = pow(1.0 - facing, uRimPower);
+            gl_FragColor = vec4(uColor, rim * uRimStrength);
+          }
+        `,
+        transparent: true,
+        depthTest: true,
+        depthWrite: false,
+        side: THREE.FrontSide,
+      });
+    }
+    mesh.material = mesh.userData.outlineMaterial;
+    mesh.renderOrder = -1;
+    mesh.visible = true;
+  } else {
+    mesh.visible = false;
+  }
   mesh.userData.isDimmed = true;
 }
 
@@ -508,6 +807,12 @@ function applyActive(mesh) {
   mat.opacity = regionAlpha;
   mat.transparent = regionAlpha < 1;
   mat.depthWrite = regionAlpha >= 1;
+  if (mesh.userData.isRoot && activeAtlas.coordSystem !== 'allen') {
+    // Macaque init view: reset any outline-mode flags applyDimmed may have
+    // left on the mesh so root renders as a solid brain.
+    mat.depthTest = true;
+    mesh.renderOrder = 0;
+  }
   mat.needsUpdate = true;
   mesh.material = mat;
   mesh.visible = true;
@@ -525,42 +830,72 @@ function findNearestAncestorWithMesh(structureId) {
 }
 
 function isolateRegion(structureId) {
-  const activeIds = getDescendantIds(structureId);
+  // Resolve the mesh ID to spotlight: the structure itself if its mesh is loaded,
+  // otherwise the nearest ancestor that has a loaded mesh.
+  const targetId = meshObjects[structureId] ? structureId : findNearestAncestorWithMesh(structureId);
+  const activeSet = targetId != null ? new Set([targetId]) : new Set();
 
-  // If the selected structure has no loaded mesh, show nearest ancestor that does
-  let fallbackId = null;
-  if (!meshObjects[structureId]) {
-    fallbackId = findNearestAncestorWithMesh(structureId);
-    if (fallbackId) activeIds.add(fallbackId);
-  }
-
-  // Load any descendant meshes that aren't loaded yet
+  // Speculatively pre-load descendant meshes so navigation into the subtree is
+  // instant. Note: descendants are NOT made visible in region view (only the
+  // clicked mesh is — see applyMeshTreatments). The pre-load is a cache warm,
+  // not a visibility decision.
+  const subtreeIds = getDescendantIds(structureId);
+  if (targetId != null) subtreeIds.add(targetId);
   const toLoad = [];
-  for (const id of activeIds) {
+  for (const id of subtreeIds) {
     if (!meshObjects[id] && (dataStructureIds.has(id) || ancestorStructureIds.has(id))) {
       toLoad.push(ensureMeshLoaded(id));
     }
   }
-  Promise.all(toLoad).then(() => applyIsolation(structureId, activeIds, fallbackId));
+  Promise.all(toLoad).then(() => applyMeshTreatments(activeSet));
 
   // Apply immediately to already-loaded meshes
-  applyIsolation(structureId, activeIds, fallbackId);
+  applyMeshTreatments(activeSet);
 }
 
-function applyIsolation(selectedStructureId, activeIds, fallbackId) {
-  // Show the selected (or fallback) mesh, keep the root as glass context,
-  // and hide the rest.
-  const showId = meshObjects[selectedStructureId] ? selectedStructureId : fallbackId;
+// Scene-level visibility orchestrator. Iterates every loaded mesh and
+// dispatches each to the appropriate per-mesh primitive (applyActive,
+// applyDimmed, restoreOriginal) based on the active set and the current
+// atlas. This single function is called by every view that changes
+// scene state — region view, dandiset view, session view, tree-filter
+// view — so the visibility policy lives in exactly one place.
+//
+// activeIds: Set of structure IDs that should be treated as "active"
+// (rendered with applyActive). For region view this is a singleton; for
+// dandiset/session views it's the set of regions covered by the
+// dandiset/session. For the atlas init view it contains just the root.
+//
+// isMeshHidden: optional callback (meshId) => boolean. If provided and
+// returns true for a given mesh, the mesh is dimmed even if it's in
+// activeIds. Used by the dandiset/session view to honor per-region hide
+// toggles in the right panel.
+//
+// Treatment dispatch:
+// - Allen root: always glass via restoreOriginal, regardless of selection.
+// - Macaque root in activeIds (atlas init view only): solid opaque via applyActive.
+// - Macaque root not in activeIds: fresnel rim via applyDimmed.
+// - Active data mesh (and not user-hidden): applyActive.
+// - Active data mesh that is user-hidden: applyDimmed.
+// - Non-active mesh: applyDimmed (hidden on Allen, hidden on macaque non-root too).
+function applyMeshTreatments(activeIds, isMeshHidden = null) {
+  const isAllen = activeAtlas.coordSystem === 'allen';
+  const rootId = meshManifest.root_id;
   for (const [idStr, mesh] of Object.entries(meshObjects)) {
     const id = parseInt(idStr);
-    if (id === showId) {
-      if (id === meshManifest.root_id) {
-        restoreOriginal(mesh);
-      } else {
-        applyActive(mesh);
-      }
-    } else if (id === meshManifest.root_id) {
+
+    // Allen root is always glass, regardless of whether it's in the active set.
+    if (id === rootId && isAllen) {
       restoreOriginal(mesh);
+      continue;
+    }
+
+    let active = activeIds.has(id);
+    if (active && isMeshHidden && isMeshHidden(id)) {
+      active = false;
+    }
+
+    if (active) {
+      applyActive(mesh);
     } else {
       applyDimmed(mesh);
     }
@@ -683,24 +1018,13 @@ async function selectDandiset(dandisetId, { pushState = true } = {}) {
     }
   }
 
-  // Apply isolation: show active regions, keep root as context, hide everything else
-  activeSet.delete(meshManifest.root_id);
-  for (const [idStr, mesh] of Object.entries(meshObjects)) {
-    const id = parseInt(idStr);
-    if (id === meshManifest.root_id) {
-      restoreOriginal(mesh);
-    } else if (activeSet.has(id)) {
-      const regions = meshToRegions.get(id) || [id];
-      const allHidden = regions.every(rid => hiddenRegionIds.has(rid));
-      if (!allHidden) {
-        applyActive(mesh);
-      } else {
-        applyDimmed(mesh);
-      }
-    } else {
-      applyDimmed(mesh);
-    }
-  }
+  // Apply scene visibility: active regions get applyActive, root gets
+  // atlas-appropriate treatment, everything else is hidden. Honors per-region
+  // hide toggles via the isMeshHidden callback.
+  applyMeshTreatments(activeSet, (meshId) => {
+    const regions = meshToRegions.get(meshId) || [meshId];
+    return regions.every(rid => hiddenRegionIds.has(rid));
+  });
 
   // Update right panel to show dandiset info
   updateDandisetPanel(dandisetId, structureIds);
@@ -772,11 +1096,17 @@ function clearDandisetFilter() {
     el.classList.remove('dandiset-active');
   });
 
-  // Restore 3D view
-  showAllRegions();
+  // Restore 3D view to init state. Allen keeps showAllRegions (restores the
+  // wireframe-context frosted-brain init look); macaque routes through
+  // selectRegion(root) so only root is visible.
   selectedDandiset = null;
   selectedId = null;
   dandisetSubjectCounts = null;
+  if (activeAtlas.coordSystem === 'allen') {
+    showAllRegions();
+  } else if (meshManifest && meshManifest.root_id != null) {
+    selectRegion(meshManifest.root_id, { pushState: false, expandTree: false });
+  }
 
   // Clear URL hash
   history.pushState(null, '', window.location.pathname);
@@ -873,7 +1203,13 @@ async function updateDandisetPanel(dandisetId, structureIds) {
   }
 
   const allRegionIds = [...uniqueRegionIds];
-  const allSubjects = [...subjectMap.entries()];
+  // Natural sort: Intl.Collator with numeric: true sorts "2" before "10".
+  // JS has no natsort equivalent, so this is the idiomatic zero-dependency approach.
+  const natCollator = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' });
+  const allSubjects = [...subjectMap.entries()].sort((a, b) => natCollator.compare(a[0], b[0]));
+  for (const [, entry] of allSubjects) {
+    entry.assets.sort((a, b) => natCollator.compare(a.session || a.path, b.session || b.path));
+  }
 
   // Filter subjects by region if a region filter is active
   let displaySubjects = allSubjects;
@@ -1322,11 +1658,16 @@ async function isolateStructureIds(structureIds) {
     }
   }
 
-  activeSet.delete(meshManifest.root_id);
+  const isAllen = activeAtlas.coordSystem === 'allen';
+  if (isAllen) activeSet.delete(meshManifest.root_id);
   for (const [idStr, mesh] of Object.entries(meshObjects)) {
     const id = parseInt(idStr);
     if (id === meshManifest.root_id) {
-      restoreOriginal(mesh);
+      if (isAllen) {
+        restoreOriginal(mesh);
+      } else {
+        applyDimmed(mesh);
+      }
     } else if (activeSet.has(id)) {
       // Show mesh only if at least one of its represented regions is not hidden
       const regions = meshToRegions.get(id) || [id];
@@ -1420,7 +1761,7 @@ function selectSubjectByDir(dandisetId, subjectDir, sessionAssetId) {
 async function fetchElectrodes(dandisetId) {
   if (dandisetElectrodes[dandisetId]) return dandisetElectrodes[dandisetId];
   try {
-    const resp = await fetch(`data/electrodes/${dandisetId}.json`);
+    const resp = await fetch(`${activeAtlas.dataPrefix}electrodes/${dandisetId}.json`);
     if (!resp.ok) return null;
     const data = await resp.json();
     dandisetElectrodes[dandisetId] = data;
@@ -1475,16 +1816,18 @@ async function showElectrodePointsForAssets(dandisetId, assetRefs, { colorBySess
   }
   if (!coords || coords.length === 0) return;
 
-  // Detect coordinate unit: Allen CCF is in micrometers (max ~13200).
-  // Some NWB files store coords in 10µm voxel units (max ~1320).
+  // Detect coordinate unit for Allen CCF (micrometers vs 10um voxels).
+  // D99 coordinates are already in mm matching the meshes, no scaling needed.
   let scale = 1;
-  let maxVal = 0;
-  for (const c of coords) {
-    for (let j = 0; j < 3; j++) {
-      if (Math.abs(c[j]) > maxVal) maxVal = Math.abs(c[j]);
+  if (activeAtlas.coordSystem === 'allen') {
+    let maxVal = 0;
+    for (const c of coords) {
+      for (let j = 0; j < 3; j++) {
+        if (Math.abs(c[j]) > maxVal) maxVal = Math.abs(c[j]);
+      }
     }
+    if (maxVal > 100 && maxVal < 1500) scale = 10;
   }
-  if (maxVal > 100 && maxVal < 1500) scale = 10;
 
   const geometry = new THREE.BufferGeometry();
   const positions = new Float32Array(coords.length * 3);
@@ -1501,7 +1844,7 @@ async function showElectrodePointsForAssets(dandisetId, assetRefs, { colorBySess
   const alphaSlider = document.getElementById('electrode-alpha');
   const material = new THREE.PointsMaterial({
     color: 0xff4466,
-    size: 150,
+    size: activeAtlas.electrodeSize,
     sizeAttenuation: true,
     vertexColors: colorBySession,
     transparent: true,
@@ -1585,7 +1928,8 @@ function updateRegionPanel(structureId) {
   const name = region ? region.name : s.name;
   const acronym = region ? region.acronym : s.acronym;
   const color = region ? region.color_hex_triplet : (s.color_hex_triplet || 'aaaaaa');
-  const atlasUrl = `https://atlas.brain-map.org/atlas#atlas=2&structure=${structureId}`;
+  const atlasLinkTemplate = activeAtlas.regionLinkTemplate;
+  const atlasUrl = atlasLinkTemplate ? atlasLinkTemplate.replace('{id}', structureId) : null;
 
   // Merge all dandisets (direct + sub-region) into one deduplicated list
   let allDandisets = [];
@@ -1605,9 +1949,12 @@ function updateRegionPanel(structureId) {
     const end = Math.min(start + PAGE_SIZE, allDandisets.length);
     const pageDandisets = allDandisets.slice(start, end);
 
+    const extLink = atlasUrl
+      ? ` <a class="region-ext-link" href="${atlasUrl}" target="_blank" rel="noopener" title="View on atlas">&#8599;</a>`
+      : '';
     let html = `
       <div class="region-header">
-        <div class="region-name">${name} <a class="region-ext-link" href="${atlasUrl}" target="_blank" rel="noopener" title="View on Allen Brain Atlas">&#8599;</a></div>
+        <div class="region-name">${name}${extLink}</div>
         <div class="region-acronym">${acronym}</div>
         <div class="region-color-bar" style="background: #${color}"></div>
       </div>
@@ -1932,6 +2279,10 @@ function updateLoadingText(text) {
   if (el) el.textContent = text;
 }
 
+function showLoading() {
+  document.getElementById('loading-overlay').classList.remove('hidden');
+}
+
 function hideLoading() {
   document.getElementById('loading-overlay').classList.add('hidden');
 }
@@ -1944,19 +2295,34 @@ function animate() {
 }
 
 // ── Orientation Buttons ────────────────────────────────────────────────────
-// Allen CCF OBJ coords: X = anterior-posterior, Y = dorsal(low)-ventral(high), Z = left-right
 function setView(view) {
   const c = brainCenter;
-  switch (view) {
-    case 'dorsal':    camera.position.set(c.x, c.y - CAM_DIST, c.z); camera.up.set(-1, 0, 0); break;
-    case 'ventral':   camera.position.set(c.x, c.y + CAM_DIST, c.z); camera.up.set(1, 0, 0);  break;
-    case 'anterior':  camera.position.set(c.x - CAM_DIST, c.y, c.z); camera.up.set(0, -1, 0); break;
-    case 'posterior': camera.position.set(c.x + CAM_DIST, c.y, c.z); camera.up.set(0, -1, 0); break;
-    case 'left':      camera.position.set(c.x, c.y, c.z - CAM_DIST); camera.up.set(0, -1, 0); break;
-    case 'right':     camera.position.set(c.x, c.y, c.z + CAM_DIST); camera.up.set(0, -1, 0); break;
+  const d = activeAtlas.camDist;
+
+  if (activeAtlas.coordSystem === 'ras') {
+    // RAS: X=Right, Y=Anterior, Z=Superior
+    switch (view) {
+      case 'dorsal':    camera.position.set(c.x, c.y, c.z + d); camera.up.set(0, 1, 0); break;
+      case 'ventral':   camera.position.set(c.x, c.y, c.z - d); camera.up.set(0, -1, 0); break;
+      case 'anterior':  camera.position.set(c.x, c.y + d, c.z); camera.up.set(0, 0, 1); break;
+      case 'posterior': camera.position.set(c.x, c.y - d, c.z); camera.up.set(0, 0, 1); break;
+      case 'left':      camera.position.set(c.x - d, c.y, c.z); camera.up.set(0, 0, 1); break;
+      case 'right':     camera.position.set(c.x + d, c.y, c.z); camera.up.set(0, 0, 1); break;
+    }
+  } else {
+    // Allen CCF: X = anterior-posterior, Y = dorsal(low)-ventral(high), Z = left-right
+    switch (view) {
+      case 'dorsal':    camera.position.set(c.x, c.y - d, c.z); camera.up.set(-1, 0, 0); break;
+      case 'ventral':   camera.position.set(c.x, c.y + d, c.z); camera.up.set(1, 0, 0);  break;
+      case 'anterior':  camera.position.set(c.x - d, c.y, c.z); camera.up.set(0, -1, 0); break;
+      case 'posterior': camera.position.set(c.x + d, c.y, c.z); camera.up.set(0, -1, 0); break;
+      case 'left':      camera.position.set(c.x, c.y, c.z - d); camera.up.set(0, -1, 0); break;
+      case 'right':     camera.position.set(c.x, c.y, c.z + d); camera.up.set(0, -1, 0); break;
+    }
   }
-  controls.target.copy(c);
-  controls.update();
+  // Recreate OrbitControls so it caches a fresh quaternion matching
+  // the new camera.up. Without this, mouse orbit uses the stale axis.
+  recreateOrbitControls(c);
 }
 
 document.getElementById('orient-buttons').addEventListener('click', (e) => {
@@ -2063,7 +2429,7 @@ function setHash(hash) {
 async function applyHashState() {
   const hash = location.hash.slice(1); // remove '#'
   if (!hash) {
-    // No hash — show default view
+    // No hash — show default (init) view.
     if (selectedId !== null || selectedDandiset !== null) {
       selectedId = null;
       selectedDandiset = null;
@@ -2073,7 +2439,16 @@ async function applyHashState() {
       clearElectrodePoints();
       const prevEl = document.querySelector('.tree-node-content.selected');
       if (prevEl) prevEl.classList.remove('selected');
-      showAllRegions();
+      // Allen: restore all loaded data-region meshes to their original
+      // wireframe-context opacity (the "frosted brain" init look).
+      // Macaque: route through selectRegion(root) so only root is visible,
+      // matching startup. showAllRegions on macaque would leak previously
+      // loaded region meshes into the init view.
+      if (activeAtlas.coordSystem === 'allen') {
+        showAllRegions();
+      } else if (meshManifest && meshManifest.root_id != null) {
+        selectRegion(meshManifest.root_id, { pushState: false, expandTree: false });
+      }
       updateTreeBadges();
       // Clear dandiset filter bar
       document.getElementById('dandiset-filter-bar').classList.add('hidden');
@@ -2116,3 +2491,41 @@ init().catch(err => {
   console.error('Failed to initialize:', err);
   updateLoadingText(`Error: ${err.message}`);
 });
+
+// Debug hook (opt-in via ?debug=1). Exposes internal state to Playwright and
+// DevTools so rendering issues can be diagnosed without UI clicking.
+if (new URLSearchParams(window.location.search).get('debug') === '1') {
+  window.__debug = {
+    get scene() { return scene; },
+    get camera() { return camera; },
+    get controls() { return controls; },
+    get meshObjects() { return meshObjects; },
+    get meshManifest() { return meshManifest; },
+    get dandiRegions() { return dandiRegions; },
+    get activeAtlas() { return activeAtlas; },
+    get THREE() { return THREE; },
+    meshBounds(id) {
+      const m = meshObjects[id];
+      if (!m) return null;
+      const box = new THREE.Box3().setFromObject(m);
+      const c = box.getCenter(new THREE.Vector3());
+      return {
+        id,
+        visible: m.visible,
+        worldPosition: m.getWorldPosition(new THREE.Vector3()).toArray(),
+        boundsMin: box.min.toArray(),
+        boundsMax: box.max.toArray(),
+        center: c.toArray(),
+      };
+    },
+    cameraState() {
+      return {
+        position: camera.position.toArray(),
+        up: camera.up.toArray(),
+        target: controls ? controls.target.toArray() : null,
+        matrixWorld: camera.matrixWorld.elements,
+      };
+    },
+  };
+  console.log('[debug] window.__debug exposed');
+}
