@@ -1745,26 +1745,6 @@ def extract_atlas_coords(url, asset_id, hdf5_path):
     }
 
 
-def lookup_voxel_regions(raw_coords, nifti_data, inv_affine):
-    """Look up NIfTI label IDs for a list of world-space coordinates.
-
-    Returns list of integer label IDs (0 = outside volume).
-    """
-    labels = []
-    for coord in raw_coords:
-        voxel = inv_affine @ [coord[0], coord[1], coord[2], 1.0]
-        vi, vj, vk = int(round(voxel[0])), int(round(voxel[1])), int(round(voxel[2]))
-        if (
-            0 <= vi < nifti_data.shape[0]
-            and 0 <= vj < nifti_data.shape[1]
-            and 0 <= vk < nifti_data.shape[2]
-        ):
-            labels.append(int(nifti_data[vi, vj, vk]))
-        else:
-            labels.append(0)
-    return labels
-
-
 # ---------------------------------------------------------------------------
 # DANDI data extraction
 # ---------------------------------------------------------------------------
@@ -1827,61 +1807,21 @@ def _map_regions_by_abbreviation(brain_region_ids, abbrev_to_id, id_to_structure
     return regions
 
 
-def _map_regions_by_voxel(raw_coords, nifti_data, inv_affine, id_to_structure):
-    """Map electrode coordinates to structure graph regions via voxel lookup."""
-    labels = lookup_voxel_regions(raw_coords, nifti_data, inv_affine)
-    regions = []
-    seen = set()
-    for label_id in labels:
-        if label_id in seen:
-            continue
-        seen.add(label_id)
-        if label_id == 0:
-            regions.append({
-                "id": OUTSIDE_ID,
-                "acronym": "outside",
-                "name": "Outside atlas",
-            })
-        elif label_id in id_to_structure:
-            s = id_to_structure[label_id]
-            regions.append({
-                "id": label_id,
-                "acronym": s["acronym"],
-                "name": s["name"],
-            })
-    return regions
-
-
 def fetch_dandi_data(
     config, abbrev_to_id, id_to_structure, parent_map,
 ):
     """Fetch electrode data from DANDI 001636 and build all output files.
 
-    Region mapping is abbreviation-primary: whatever the NWB stores in
-    brain_region_id wins. For MEBRAINS, voxel lookup against the parcellation
-    NIfTI is kept as a fallback for older files that don't populate
-    brain_region_id; it is loaded lazily only if the fallback fires.
+    Region mapping is abbreviation-primary: each electrode's brain_region_id
+    is dict-looked-up in the structure graph. Rows with missing or unresolved
+    brain_region_id contribute coordinates only — they don't add any region
+    to the asset's region attribution. This matches the file-level aggregation
+    model used by the Allen CCF pipeline (see scripts/update_data.py).
     """
     hdf5_path = config["hdf5_path"]
     cache_file = config["cache_file"]
     data_dir = config["output_dir"]
     electrodes_dir = data_dir / "electrodes"
-
-    voxel_fallback_enabled = config.get("labels_type") == "mebrains"
-    _voxel_state = {"loaded": False, "nifti_data": None, "inv_affine": None}
-
-    def _load_voxel_fallback():
-        if _voxel_state["loaded"]:
-            return _voxel_state["nifti_data"], _voxel_state["inv_affine"]
-        _voxel_state["loaded"] = True
-        if not voxel_fallback_enabled:
-            return None, None
-        import nibabel as nib
-        print("Loading parcellation NIfTI for voxel lookup fallback...")
-        img = nib.load(str(config["nifti"]))
-        _voxel_state["nifti_data"] = np.asarray(img.dataobj, dtype=np.int16)
-        _voxel_state["inv_affine"] = np.linalg.inv(img.affine)
-        return _voxel_state["nifti_data"], _voxel_state["inv_affine"]
 
     print(f"Fetching assets from dandiset {DANDISET_ID}...")
     assets = list(get_nwb_assets_paged(DANDISET_ID))
@@ -1954,19 +1894,15 @@ def fetch_dandi_data(
             skipped_no_loc += 1
             continue
 
-        # Map electrodes to regions. Abbreviation path is primary; voxel
-        # lookup is a fallback for older NWBs that don't populate
-        # brain_region_id (MEBRAINS only).
+        # Map electrodes to regions via abbreviation lookup against the
+        # structure graph. Rows with missing or unresolved brain_region_id
+        # contribute nothing to the asset's region set (file-level
+        # aggregation: same forgiveness as Allen's location-string matching).
         brain_ids = result.get("brain_region_id") or []
         if brain_ids:
             regions = _map_regions_by_abbreviation(
                 brain_ids, abbrev_to_id, id_to_structure,
             )
-        elif voxel_fallback_enabled and result.get("raw_coords"):
-            nd, ia = _load_voxel_fallback()
-            regions = _map_regions_by_voxel(
-                result["raw_coords"], nd, ia, id_to_structure,
-            ) if nd is not None else []
         else:
             regions = []
 
