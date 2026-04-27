@@ -54,8 +54,19 @@ const ATLAS_CONFIGS = {
     camOffset: [1, 0, 0],  // X=Right in RAS, lateral view
     nearPlane: 0.1,
     farPlane: 1000,
-    electrodeSize: 3,
-    electrodePickThreshold: 4,
+    // Electrode visual size: 0.75 mm matches Allen CCF's ~1.5% of brain width
+    // proportion (Allen uses 150 µm in a ~10,000 µm-wide brain). This is a
+    // proportional calibration to keep visual identity consistent across
+    // atlases — it is not a measurement of real electrode hardware (real
+    // Neuropixels contacts are ~12 µm; we exaggerate so users can see them).
+    // Re-calibrate when more macaque electrode datasets become available and
+    // we have a clearer picture of typical session electrode counts and
+    // recording-site distributions on macaque atlases. The pick threshold is
+    // ~1.33× the visual size to keep hover picking forgiving without being
+    // misleading. Same values across all three macaque atlases by convention
+    // (D99, NMT, MEBRAINS share the mm-equivalent RAS coordinate scale).
+    electrodeSize: 0.75,
+    electrodePickThreshold: 1.0,
     rootOpacity: 0.3,
     coordSystem: 'ras',
     attribution: 'Atlas: D99 v2 (Saleem & Logothetis)',
@@ -70,8 +81,8 @@ const ATLAS_CONFIGS = {
     camOffset: [1, 0, 0],  // X=Right in RAS, lateral view
     nearPlane: 0.1,
     farPlane: 1000,
-    electrodeSize: 3,
-    electrodePickThreshold: 4,
+    electrodeSize: 0.75,
+    electrodePickThreshold: 1.0,
     rootOpacity: 0.3,
     coordSystem: 'ras',
     attribution: 'Atlas: NMT v2 (Jung et al. 2021)',
@@ -86,8 +97,8 @@ const ATLAS_CONFIGS = {
     camOffset: [1, 0, 0],  // X=Right in RAS, lateral view
     nearPlane: 0.1,
     farPlane: 1000,
-    electrodeSize: 3,
-    electrodePickThreshold: 4,
+    electrodeSize: 0.75,
+    electrodePickThreshold: 1.0,
     rootOpacity: 0.25,
     coordSystem: 'ras',
     attribution: 'Atlas: MEBRAINS (EBRAINS)',
@@ -110,6 +121,25 @@ const ATLAS_COORD_LABELS = {
 let activeAtlasKey = 'allen_ccf';
 let activeAtlas = ATLAS_CONFIGS.allen_ccf;
 
+// Single source of truth for which view the user is currently in. Set by the
+// navigation functions (selectRegion, selectDandiset, selectSubjectByDir,
+// applyHashState's no-hash branch). Read by view-conditional logic such as
+// the electrode auto-drop in showElectrodePointsForAssets.
+//
+// Values:
+//   'init'     — atlas init view (root selected, no dandiset).
+//   'region'   — a non-root region is selected (no dandiset).
+//   'dandiset' — a dandiset is selected, no specific subject yet.
+//   'subject'  — a subject within a dandiset is selected, no specific session.
+//   'session'  — a specific session/asset is selected (electrodes typically shown).
+//
+// This is somewhat redundant with selectedId / selectedDandiset / etc. but
+// centralizes the "what view" question so callers don't have to reconstruct
+// it from multiple flags. The flags remain authoritative for their specific
+// data (selectedId is the actual region ID); currentView is the categorical
+// summary.
+let currentView = 'init';
+
 // Sets for quick lookups
 let dataStructureIds = new Set();
 let ancestorStructureIds = new Set();
@@ -120,7 +150,14 @@ let dandisetAssets = {};        // dandiset_id -> [{path, asset_id, regions}]
 let selectedDandiset = null;
 let dandisetElectrodes = {};  // cache: dandiset_id -> {asset_id: [[x,y,z], ...]}
 let electrodePoints = null;   // THREE.Points object
-let regionAlpha = 1;          // global opacity multiplier for brain meshes
+let regionSliderOpacityValue = 1;          // mirrors the Regions slider value (range 0-1)
+let electrodeSliderOpacityValue = 1;       // mirrors the Electrodes slider value (range 0-1)
+
+// Default Regions slider value when entering a view that displays electrodes.
+// Auto-applied in showElectrodePointsForAssets so electrodes inside the active
+// region aren't occluded by it. User can re-raise after; the auto-drop only
+// fires when the slider was higher than this value.
+const ELECTRODE_VIEW_DEFAULT_REGION_ALPHA = 0.5;
 let dandisetRegionFilter = null; // structure_id when filtering subjects by region within a dandiset
 let dandisetSubjectCounts = null; // { directSubjects, totalSubjects } when a dandiset is selected
 let hiddenRegionIds = new Set();  // regions toggled off by user in dandiset/subject view
@@ -220,7 +257,7 @@ async function loadAtlas(atlasKey) {
   // Select root BEFORE hiding the loading overlay so the user never sees
   // the undimmed "speckled brain" state between the last mesh load and
   // applyMeshTreatments. Late-arriving ancestor meshes (triggered by
-  // isolateRegion's own toLoad queue) dim themselves via loadMesh's
+  // spotlightRegion's own toLoad queue) dim themselves via loadMesh's
   // post-add isolation check.
   const rootNode = structureGraph[0];
   if (rootNode) selectRegion(rootNode.id, { expandTree: true, pushState: false });
@@ -478,28 +515,15 @@ function loadMesh(structureId) {
         scene.add(mesh);
         meshObjects[structureId] = mesh;
 
-        // When meshes load asynchronously mid-selection, apply the same
-        // isolation treatment applyMeshTreatments would have applied so late
-        // arrivals don't flash in visible. (This is per-mesh logic that
-        // mirrors applyMeshTreatments's per-mesh dispatch but runs only on
-        // the one newly-loaded mesh; could be unified into a shared
-        // treatMesh primitive in a future refactor.)
+        // When meshes load asynchronously mid-selection, give them the same
+        // treatment applyMeshTreatments would assign so late arrivals don't
+        // flash in visible. Uses the same decideTreatment/treatMesh primitives
+        // as the orchestrator, so policy lives in one place.
         if (selectedId !== null) {
-          const isAllen = activeAtlas.coordSystem === 'allen';
-          const isRoot = structureId === meshManifest.root_id;
-          if (structureId === selectedId) {
-            if (isRoot && isAllen) restoreOriginal(mesh);
-            else applyActive(mesh);
-          } else if (isRoot && isAllen) {
-            restoreOriginal(mesh);
-          } else {
-            applyDimmed(mesh);
-          }
+          treatMesh(mesh, decideTreatment(structureId, new Set([selectedId])));
         } else if (selectedDandiset !== null) {
           const dandiStructures = new Set(dandisetToStructures[selectedDandiset] || []);
-          if (!dandiStructures.has(structureId)) {
-            applyDimmed(mesh);
-          }
+          treatMesh(mesh, decideTreatment(structureId, dandiStructures));
         }
 
         resolve(mesh);
@@ -733,91 +757,160 @@ function getDescendantIds(structureId) {
   return ids;
 }
 
-function applyDimmed(mesh) {
-  if (activeAtlas.coordSystem === 'allen') {
-    // CCF: hide completely.
-    mesh.visible = false;
-    mesh.userData.isDimmed = true;
-    return;
-  }
-  // Macaque: non-root meshes hide. Root becomes a fresnel-rim silhouette so
-  // the selected region has a spatial context without the "fog" that a
-  // flat-alpha outline produced.
-  if (mesh.userData.isRoot) {
+// ── Mesh treatment: policy + mechanism ──────────────────────────────────────
+//
+// The "treatment" of a mesh is its visual role in the current scene state.
+// Four possible values:
+//   'active'     — spotlight; the focused content of the current view.
+//   'glass'      — translucent original material; Allen root only, always.
+//   'silhouette' — fresnel-rim outline; macaque root when not active.
+//   'hidden'     — visible=false; anything else not in the active set.
+//
+// Each mesh stores its current treatment in mesh.userData.treatment.
+//
+// Two functions cleanly split the concerns:
+//
+// - decideTreatment(meshId, activeIds): pure policy. Given the current
+//   selection's active set, returns the treatment string for a mesh ID.
+//
+// - treatMesh(mesh, treatment): the single mutator. Given a treatment name,
+//   sets all relevant material/visibility/depth properties, derived from the
+//   current regionSliderOpacityValue and atlas. Every code path that mutates a mesh's
+//   visual state goes through this function — there is no other place that
+//   knows about depthWrite, transparent, etc. This prevents the class of bug
+//   where one call site (e.g. the slider handler) updates opacity but forgets
+//   depthWrite, leaving the mesh in an inconsistent state.
+
+// Build the fresnel-rim ShaderMaterial used for the macaque root in dimmed
+// state. Cached on mesh.userData.outlineMaterial so the shader is compiled
+// once per mesh, not per dim cycle.
+function buildFresnelMaterial(origMaterial) {
+  const color = origMaterial.color ? origMaterial.color.clone() : new THREE.Color(0xcccccc);
+  return new THREE.ShaderMaterial({
+    uniforms: {
+      uColor: { value: color },
+      uRimPower: { value: 2.5 },
+      uRimStrength: { value: 0.9 },
+    },
+    vertexShader: `
+      varying vec3 vNormal;
+      varying vec3 vViewDir;
+      void main() {
+        vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+        vNormal = normalize(normalMatrix * normal);
+        vViewDir = normalize(-mvPosition.xyz);
+        gl_Position = projectionMatrix * mvPosition;
+      }
+    `,
+    fragmentShader: `
+      uniform vec3 uColor;
+      uniform float uRimPower;
+      uniform float uRimStrength;
+      varying vec3 vNormal;
+      varying vec3 vViewDir;
+      void main() {
+        float facing = abs(dot(normalize(vNormal), vViewDir));
+        float rim = pow(1.0 - facing, uRimPower);
+        gl_FragColor = vec4(uColor, rim * uRimStrength);
+      }
+    `,
+    transparent: true,
+    depthTest: true,
+    depthWrite: false,
+    side: THREE.FrontSide,
+  });
+}
+
+// Pure policy: which treatment should this mesh have given the active set?
+// Returns one of:
+//   'active'     — spotlight (visible, opacity from slider, depthWrite if opaque).
+//   'glass'      — translucent original material; currently only Allen root.
+//   'silhouette' — fresnel-rim outline; currently only non-active macaque root.
+//   'hidden'     — mesh.visible = false; everything else not in the active set.
+function decideTreatment(meshId, activeIds) {
+  const isAllen = activeAtlas.coordSystem === 'allen';
+  const isRoot = meshId === meshManifest.root_id;
+  // Allen root is always glass, regardless of selection state.
+  if (isRoot && isAllen) return 'glass';
+  // In the active set → spotlight.
+  if (activeIds.has(meshId)) return 'active';
+  // Macaque root, not in active set → fresnel-rim silhouette for context.
+  if (isRoot) return 'silhouette';
+  // Anything else not active → completely hidden.
+  return 'hidden';
+}
+
+// Single mutator. Apply a treatment to a mesh, deriving all properties from
+// current regionSliderOpacityValue and atlas. Sets mesh.userData.treatment so callers that
+// re-apply (slider handler) can read back the current treatment.
+function treatMesh(mesh, treatment) {
+  const orig = mesh.userData.originalMaterial;
+  if (!orig) return;
+  const isAllen = activeAtlas.coordSystem === 'allen';
+  const isRoot = mesh.userData.isRoot;
+
+  if (treatment === 'active') {
+    if (regionSliderOpacityValue === 0) {
+      mesh.visible = false;
+    } else {
+      const mat = orig.clone();
+      mat.opacity = regionSliderOpacityValue;
+      mat.transparent = regionSliderOpacityValue < 1;
+      mat.depthWrite = regionSliderOpacityValue >= 1;
+      if (isRoot && !isAllen) {
+        // Macaque root coming out of fresnel mode: reset state the
+        // outline material left on the mesh so root renders as a solid brain.
+        mat.depthTest = true;
+        mesh.renderOrder = 0;
+      }
+      mat.needsUpdate = true;
+      mesh.material = mat;
+      mesh.visible = true;
+    }
+  } else if (treatment === 'glass') {
+    // Allen root only: original (translucent) material at slider-modulated alpha.
+    if (regionSliderOpacityValue === 0) {
+      mesh.visible = false;
+    } else {
+      const mat = orig.clone();
+      mat.opacity = orig.opacity * regionSliderOpacityValue;
+      mat.transparent = mat.opacity < 1;
+      mat.needsUpdate = true;
+      mesh.material = mat;
+      mesh.visible = true;
+    }
+  } else if (treatment === 'silhouette') {
+    // Fresnel-rim outline. Currently only used for non-active macaque root,
+    // to provide spatial context without the "fog" that a flat-alpha outline
+    // produced.
     if (!mesh.userData.outlineMaterial) {
-      const orig = mesh.userData.originalMaterial;
-      const color = orig.color ? orig.color.clone() : new THREE.Color(0xcccccc);
-      mesh.userData.outlineMaterial = new THREE.ShaderMaterial({
-        uniforms: {
-          uColor: { value: color },
-          uRimPower: { value: 2.5 },
-          uRimStrength: { value: 0.9 },
-        },
-        vertexShader: `
-          varying vec3 vNormal;
-          varying vec3 vViewDir;
-          void main() {
-            vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
-            vNormal = normalize(normalMatrix * normal);
-            vViewDir = normalize(-mvPosition.xyz);
-            gl_Position = projectionMatrix * mvPosition;
-          }
-        `,
-        fragmentShader: `
-          uniform vec3 uColor;
-          uniform float uRimPower;
-          uniform float uRimStrength;
-          varying vec3 vNormal;
-          varying vec3 vViewDir;
-          void main() {
-            float facing = abs(dot(normalize(vNormal), vViewDir));
-            float rim = pow(1.0 - facing, uRimPower);
-            gl_FragColor = vec4(uColor, rim * uRimStrength);
-          }
-        `,
-        transparent: true,
-        depthTest: true,
-        depthWrite: false,
-        side: THREE.FrontSide,
-      });
+      mesh.userData.outlineMaterial = buildFresnelMaterial(orig);
     }
     mesh.material = mesh.userData.outlineMaterial;
     mesh.renderOrder = -1;
     mesh.visible = true;
-  } else {
+  } else if (treatment === 'hidden') {
+    // Not drawn. Used for everything not in the active set on Allen, and for
+    // macaque non-root meshes not in the active set.
     mesh.visible = false;
   }
-  mesh.userData.isDimmed = true;
+
+  mesh.userData.treatment = treatment;
+  // Back-compat: existing readers of `isDimmed` (hover-pickable filter at
+  // ~line 734, region-toggles overlay handler) check this flag. Maintained
+  // as a derived value from `treatment` — true when the mesh is in any
+  // non-focal state (silhouette or hidden) — so we don't have to update
+  // every reader at once. New code should read `treatment` directly.
+  mesh.userData.isDimmed = (treatment === 'silhouette' || treatment === 'hidden');
 }
 
-function restoreOriginal(mesh) {
-  if (mesh.userData.originalMaterial) {
-    mesh.material = mesh.userData.originalMaterial.clone();
-    mesh.material.opacity *= regionAlpha;
-    mesh.material.transparent = mesh.material.opacity < 1;
-    mesh.material.needsUpdate = true;
-  }
-  mesh.visible = true;
-  mesh.userData.isDimmed = false;
-}
-
-function applyActive(mesh) {
-  const orig = mesh.userData.originalMaterial;
-  const mat = orig.clone();
-  mat.opacity = regionAlpha;
-  mat.transparent = regionAlpha < 1;
-  mat.depthWrite = regionAlpha >= 1;
-  if (mesh.userData.isRoot && activeAtlas.coordSystem !== 'allen') {
-    // Macaque init view: reset any outline-mode flags applyDimmed may have
-    // left on the mesh so root renders as a solid brain.
-    mat.depthTest = true;
-    mesh.renderOrder = 0;
-  }
-  mat.needsUpdate = true;
-  mesh.material = mat;
-  mesh.visible = true;
-  mesh.userData.isDimmed = false;
-}
+// Thin wrappers for existing call sites (e.g. updateDandisetPanel's checkbox
+// handlers). New code should prefer treatMesh(mesh, treatment) directly. The
+// applyDimmed wrapper dispatches to 'hidden' because its callers (right-panel
+// region toggles) only ever target data meshes, never the macaque root.
+function applyActive(mesh)     { treatMesh(mesh, 'active'); }
+function applyDimmed(mesh)     { treatMesh(mesh, 'hidden'); }
+function restoreOriginal(mesh) { treatMesh(mesh, 'glass');  }
 
 function findNearestAncestorWithMesh(structureId) {
   // Walk up the hierarchy to find the closest ancestor that has a loaded mesh
@@ -829,7 +922,7 @@ function findNearestAncestorWithMesh(structureId) {
   return null;
 }
 
-function isolateRegion(structureId) {
+function spotlightRegion(structureId) {
   // Resolve the mesh ID to spotlight: the structure itself if its mesh is loaded,
   // otherwise the nearest ancestor that has a loaded mesh.
   const targetId = meshObjects[structureId] ? structureId : findNearestAncestorWithMesh(structureId);
@@ -878,27 +971,16 @@ function isolateRegion(structureId) {
 // - Active data mesh that is user-hidden: applyDimmed.
 // - Non-active mesh: applyDimmed (hidden on Allen, hidden on macaque non-root too).
 function applyMeshTreatments(activeIds, isMeshHidden = null) {
-  const isAllen = activeAtlas.coordSystem === 'allen';
-  const rootId = meshManifest.root_id;
   for (const [idStr, mesh] of Object.entries(meshObjects)) {
     const id = parseInt(idStr);
-
-    // Allen root is always glass, regardless of whether it's in the active set.
-    if (id === rootId && isAllen) {
-      restoreOriginal(mesh);
-      continue;
+    let treatment = decideTreatment(id, activeIds);
+    // Honor per-region user hide toggles (right-panel checkboxes): demote
+    // an 'active' treatment to 'hidden' when the caller says this mesh is
+    // user-hidden.
+    if (treatment === 'active' && isMeshHidden && isMeshHidden(id)) {
+      treatment = 'hidden';
     }
-
-    let active = activeIds.has(id);
-    if (active && isMeshHidden && isMeshHidden(id)) {
-      active = false;
-    }
-
-    if (active) {
-      applyActive(mesh);
-    } else {
-      applyDimmed(mesh);
-    }
+    treatMesh(mesh, treatment);
   }
 }
 
@@ -982,6 +1064,7 @@ async function selectDandiset(dandisetId, { pushState = true } = {}) {
   dandisetRegionFilter = null;
   dandisetSubjectCounts = computeDandisetSubjectCounts(dandisetId);
   hiddenRegionIds = new Set();
+  currentView = 'dandiset';
   clearElectrodePoints();
 
   // Update URL hash
@@ -1146,9 +1229,9 @@ function filterDandisetPanelByRegion(structureId, { pushState = true } = {}) {
   const dandiStructures = dandisetToStructures[selectedDandiset] || [];
   const matchingStructures = dandiStructures.filter(id => descendantIds.has(id));
   if (matchingStructures.length > 0) {
-    isolateStructureIds(matchingStructures);
+    spotlightRegions(matchingStructures);
   } else {
-    isolateStructureIds([structureId]);
+    spotlightRegions([structureId]);
   }
 
   // Highlight region in tree
@@ -1414,6 +1497,7 @@ async function updateDandisetPanel(dandisetId, structureIds) {
         const subjectName = card.querySelector('.asset-card-filename')?.textContent || subjectDir.replace(/^sub-/, '');
 
         dandisetRegionFilter = null;
+        currentView = 'subject';
         filterTreeByStructureIds(regionIds);
         showSubjectFilter(`Subject: ${subjectName}`);
         const selEl = document.querySelector('.tree-node-content.selected');
@@ -1422,7 +1506,7 @@ async function updateDandisetPanel(dandisetId, structureIds) {
         showElectrodePointsForAssets(dandisetId, electrodeAssets, { colorBySession: true });
         setHash(`dandiset=${dandisetId}&subject=${subjectDir}`);
 
-        isolateStructureIds(regionIds);
+        spotlightRegions(regionIds);
         filterRegionToggles(regionIds);
 
         panel.querySelectorAll('.asset-card').forEach(c => c.classList.remove('asset-card-selected'));
@@ -1440,6 +1524,7 @@ async function updateDandisetPanel(dandisetId, structureIds) {
         const sessionLabel = row.querySelector('.session-row-label')?.textContent || '';
 
         dandisetRegionFilter = null;
+        currentView = 'session';
         filterTreeByStructureIds(regionIds);
         showSubjectFilter(`${subjectDir.replace(/^sub-/, '')} / ${sessionLabel}`);
         const selEl = document.querySelector('.tree-node-content.selected');
@@ -1453,7 +1538,7 @@ async function updateDandisetPanel(dandisetId, structureIds) {
           setHash(`dandiset=${dandisetId}&subject=${subjectDir}`);
         }
 
-        isolateStructureIds(regionIds);
+        spotlightRegions(regionIds);
         filterRegionToggles(regionIds);
 
         panel.querySelectorAll('.asset-card').forEach(c => c.classList.remove('asset-card-selected'));
@@ -1471,6 +1556,7 @@ async function updateDandisetPanel(dandisetId, structureIds) {
         if (card.dataset.all) {
           const hadRegionFilter = dandisetRegionFilter !== null;
           dandisetRegionFilter = null;
+          currentView = 'dandiset';
           filterTreeByDandiset(dandisetId);
           hideSubjectFilter();
           clearElectrodePoints();
@@ -1478,7 +1564,7 @@ async function updateDandisetPanel(dandisetId, structureIds) {
           const selEl = document.querySelector('.tree-node-content.selected');
           if (selEl) selEl.classList.remove('selected');
           if (hadRegionFilter) {
-            isolateStructureIds(structureIds);
+            spotlightRegions(structureIds);
             updateDandisetPanel(dandisetId, structureIds);
             const newAllCard = panel.querySelector('.asset-card[data-all]');
             if (newAllCard) newAllCard.classList.add('asset-card-selected');
@@ -1486,6 +1572,9 @@ async function updateDandisetPanel(dandisetId, structureIds) {
           }
         } else {
           dandisetRegionFilter = null;
+          // Single-session subject card: with assetId it's a session view,
+          // without it's a subject view (no specific session selected).
+          currentView = card.dataset.assetId ? 'session' : 'subject';
           const subjectName = card.querySelector('.asset-card-filename')?.textContent || '';
           filterTreeByStructureIds(regionIds);
           showSubjectFilter(`Subject: ${subjectName}`);
@@ -1501,7 +1590,7 @@ async function updateDandisetPanel(dandisetId, structureIds) {
             setHash(`dandiset=${dandisetId}`);
           }
         }
-        isolateStructureIds(regionIds);
+        spotlightRegions(regionIds);
         filterRegionToggles(card.dataset.all ? null : regionIds);
 
         panel.querySelectorAll('.asset-card').forEach(c => c.classList.remove('asset-card-selected'));
@@ -1635,7 +1724,7 @@ function filterTreeByStructureIds(structureIds) {
   });
 }
 
-async function isolateStructureIds(structureIds) {
+async function spotlightRegions(structureIds) {
   const activeSet = new Set(structureIds);
 
   // Ensure meshes are loaded
@@ -1658,29 +1747,13 @@ async function isolateStructureIds(structureIds) {
     }
   }
 
-  const isAllen = activeAtlas.coordSystem === 'allen';
-  if (isAllen) activeSet.delete(meshManifest.root_id);
-  for (const [idStr, mesh] of Object.entries(meshObjects)) {
-    const id = parseInt(idStr);
-    if (id === meshManifest.root_id) {
-      if (isAllen) {
-        restoreOriginal(mesh);
-      } else {
-        applyDimmed(mesh);
-      }
-    } else if (activeSet.has(id)) {
-      // Show mesh only if at least one of its represented regions is not hidden
-      const regions = meshToRegions.get(id) || [id];
-      const allHidden = regions.every(rid => hiddenRegionIds.has(rid));
-      if (!allHidden) {
-        applyActive(mesh);
-      } else {
-        applyDimmed(mesh);
-      }
-    } else {
-      applyDimmed(mesh);
-    }
-  }
+  // Apply scene visibility: active regions get applyActive, root gets atlas-
+  // appropriate treatment (Allen=glass, macaque=silhouette), everything else
+  // is hidden. Honors per-region hide toggles via the isMeshHidden callback.
+  applyMeshTreatments(activeSet, (meshId) => {
+    const regions = meshToRegions.get(meshId) || [meshId];
+    return regions.every(rid => hiddenRegionIds.has(rid));
+  });
 }
 
 function filterRegionToggles(regionIds) {
@@ -1841,20 +1914,31 @@ async function showElectrodePointsForAssets(dandisetId, assetRefs, { colorBySess
     geometry.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
   }
 
-  const alphaSlider = document.getElementById('electrode-alpha');
   const material = new THREE.PointsMaterial({
     color: 0xff4466,
     size: activeAtlas.electrodeSize,
     sizeAttenuation: true,
     vertexColors: colorBySession,
     transparent: true,
-    opacity: parseFloat(alphaSlider.value),
+    opacity: electrodeSliderOpacityValue,
   });
 
   electrodePoints = new THREE.Points(geometry, material);
   electrodePoints.userData.pointInfo = pointInfo;
   scene.add(electrodePoints);
   document.getElementById('electrode-control-row').classList.remove('hidden');
+
+  // Auto-drop the Regions slider when electrodes appear so the active region
+  // mesh stops occluding them. User can still raise the slider if they want
+  // the region fully opaque. Only drops, never raises — respects users who
+  // had set the slider lower already. Triggered here (rather than at view
+  // transitions) because this is the precise moment electrodes become
+  // visible; views without electrode data don't need the auto-drop.
+  const regionSlider = document.getElementById('region-alpha');
+  if (regionSlider && parseFloat(regionSlider.value) > ELECTRODE_VIEW_DEFAULT_REGION_ALPHA) {
+    regionSlider.value = ELECTRODE_VIEW_DEFAULT_REGION_ALPHA;
+    regionSlider.dispatchEvent(new Event('input', { bubbles: true }));
+  }
 }
 
 function isZeroCoordinate(coord) {
@@ -1885,6 +1969,9 @@ function selectRegion(structureId, { expandTree = true, pushState = true } = {})
   selectedId = structureId;
   selectedDandiset = null;
   hiddenRegionIds = new Set();
+  // The atlas-init view is "selectRegion(root)" — same code path, different
+  // categorical view. Flag it explicitly so callers can distinguish.
+  currentView = (structureId === meshManifest.root_id) ? 'init' : 'region';
   document.getElementById('region-toggles-overlay').classList.add('hidden');
   clearElectrodePoints();
 
@@ -1894,7 +1981,7 @@ function selectRegion(structureId, { expandTree = true, pushState = true } = {})
   }
 
   // Isolate this region in the 3D view, then highlight
-  isolateRegion(structureId);
+  spotlightRegion(structureId);
   highlightMesh(structureId);
 
   // Update tree selection
@@ -2364,30 +2451,28 @@ setupResize();
 
 // ── Alpha Sliders ───────────────────────────────────────────────────────────
 document.getElementById('electrode-alpha').addEventListener('input', (e) => {
-  const val = parseFloat(e.target.value);
+  electrodeSliderOpacityValue = parseFloat(e.target.value);
   if (electrodePoints) {
-    if (val === 0) {
+    if (electrodeSliderOpacityValue === 0) {
       scene.remove(electrodePoints);
     } else {
       if (!electrodePoints.parent) scene.add(electrodePoints);
-      electrodePoints.material.opacity = val;
+      electrodePoints.material.opacity = electrodeSliderOpacityValue;
     }
   }
 });
 
 document.getElementById('region-alpha').addEventListener('input', (e) => {
-  regionAlpha = parseFloat(e.target.value);
+  regionSliderOpacityValue = parseFloat(e.target.value);
+  // Re-apply each mesh's CURRENT treatment using the new regionSliderOpacityValue. The
+  // slider doesn't decide policy (that's decideTreatment's job, run once
+  // when the selection changes); it just refreshes whatever role each mesh
+  // is already playing. treatMesh derives all property values (opacity,
+  // transparent, depthWrite, visible) from the new regionSliderOpacityValue, so the
+  // slider can never leave a mesh in an inconsistent state.
   for (const mesh of Object.values(meshObjects)) {
-    if (mesh.userData.isDimmed) continue;
-    if (regionAlpha === 0) {
-      mesh.visible = false;
-    } else {
-      mesh.visible = true;
-      const orig = mesh.userData.originalMaterial;
-      if (!orig) continue;
-      mesh.material.opacity = orig.opacity * regionAlpha;
-      mesh.material.transparent = mesh.material.opacity < 1;
-      mesh.material.needsUpdate = true;
+    if (mesh.userData.treatment) {
+      treatMesh(mesh, mesh.userData.treatment);
     }
   }
 });
@@ -2407,7 +2492,7 @@ document.getElementById('subject-filter-clear').addEventListener('click', () => 
     setHash(`dandiset=${selectedDandiset}`);
     filterTreeByDandiset(selectedDandiset);
     const structureIds = dandisetToStructures[selectedDandiset] || [];
-    isolateStructureIds(structureIds);
+    spotlightRegions(structureIds);
     // Re-render panel if region filter was active, to show all subjects
     if (hadRegionFilter) {
       updateDandisetPanel(selectedDandiset, structureIds);
@@ -2435,6 +2520,7 @@ async function applyHashState() {
       selectedDandiset = null;
       dandisetSubjectCounts = null;
       hiddenRegionIds = new Set();
+      currentView = 'init';
       document.getElementById('region-toggles-overlay').classList.add('hidden');
       clearElectrodePoints();
       const prevEl = document.querySelector('.tree-node-content.selected');
