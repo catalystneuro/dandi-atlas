@@ -122,8 +122,8 @@ let activeAtlasKey = 'allen_ccf';
 let activeAtlas = ATLAS_CONFIGS.allen_ccf;
 
 // Single source of truth for which view the user is currently in. Set by the
-// navigation functions (selectRegion, selectDandiset, selectSubjectByDir,
-// applyHashState's no-hash branch). Read by view-conditional logic such as
+// navigation functions (enterRegionView, enterDandisetView, enterSubjectViewFromURL,
+// applyURLState's no-hash branch). Read by view-conditional logic such as
 // the electrode auto-drop in showElectrodePointsForAssets.
 //
 // Values:
@@ -256,11 +256,11 @@ async function loadAtlas(atlasKey) {
 
   // Select root BEFORE hiding the loading overlay so the user never sees
   // the undimmed "speckled brain" state between the last mesh load and
-  // applyMeshTreatments. Late-arriving ancestor meshes (triggered by
+  // syncSceneToSelection. Late-arriving ancestor meshes (triggered by
   // spotlightRegion's own toLoad queue) dim themselves via loadMesh's
   // post-add isolation check.
   const rootNode = structureGraph[0];
-  if (rootNode) selectRegion(rootNode.id, { expandTree: true, pushState: false });
+  if (rootNode) enterRegionView(rootNode.id, { expandTree: true, pushState: false });
 
   hideLoading();
 
@@ -289,7 +289,7 @@ async function init() {
   animate();
 
   // URL navigation listener (browser back/forward, hash edits).
-  window.addEventListener('hashchange', () => applyHashState());
+  window.addEventListener('hashchange', () => applyURLState());
 
   // Atlas selector change handler.
   if (selector) {
@@ -323,10 +323,10 @@ async function init() {
 
   // Deep-link restore: if the URL has a hash (region/dandiset/session deep
   // link), override loadAtlas's default root selection. The user briefly sees
-  // the root view between loadAtlas's hideLoading and applyHashState's
+  // the root view between loadAtlas's hideLoading and applyURLState's
   // selection, but only on deep-link loads — direct page loads end at root.
   if (location.hash.slice(1)) {
-    applyHashState();
+    applyURLState();
   }
 }
 
@@ -516,14 +516,14 @@ function loadMesh(structureId) {
         meshObjects[structureId] = mesh;
 
         // When meshes load asynchronously mid-selection, give them the same
-        // treatment applyMeshTreatments would assign so late arrivals don't
-        // flash in visible. Uses the same decideTreatment/treatMesh primitives
+        // display mode syncSceneToSelection would assign so late arrivals don't
+        // flash in visible. Uses the same decideDisplayMode/applyDisplayMode primitives
         // as the orchestrator, so policy lives in one place.
         if (selectedId !== null) {
-          treatMesh(mesh, decideTreatment(structureId, new Set([selectedId])));
+          applyDisplayMode(mesh, decideDisplayMode(structureId, new Set([selectedId])));
         } else if (selectedDandiset !== null) {
           const dandiStructures = new Set(dandisetToStructures[selectedDandiset] || []);
-          treatMesh(mesh, decideTreatment(structureId, dandiStructures));
+          applyDisplayMode(mesh, decideDisplayMode(structureId, dandiStructures));
         }
 
         resolve(mesh);
@@ -706,7 +706,7 @@ function onClick(event) {
     if (selectedDandiset) {
       filterDandisetPanelByRegion(sid);
     } else {
-      selectRegion(sid);
+      enterRegionView(sid);
     }
   }
 }
@@ -757,23 +757,23 @@ function getDescendantIds(structureId) {
   return ids;
 }
 
-// ── Mesh treatment: policy + mechanism ──────────────────────────────────────
+// ── Mesh display mode: policy + mechanism ───────────────────────────────────
 //
-// The "treatment" of a mesh is its visual role in the current scene state.
+// The "display mode" of a mesh is its visual role in the current scene state.
 // Four possible values:
 //   'active'     — spotlight; the focused content of the current view.
 //   'glass'      — translucent original material; Allen root only, always.
 //   'silhouette' — fresnel-rim outline; macaque root when not active.
 //   'hidden'     — visible=false; anything else not in the active set.
 //
-// Each mesh stores its current treatment in mesh.userData.treatment.
+// Each mesh stores its current display mode in mesh.userData.displayMode.
 //
 // Two functions cleanly split the concerns:
 //
-// - decideTreatment(meshId, activeIds): pure policy. Given the current
-//   selection's active set, returns the treatment string for a mesh ID.
+// - decideDisplayMode(meshId, activeIds): pure policy. Given the current
+//   selection's active set, returns the display mode for a mesh ID.
 //
-// - treatMesh(mesh, treatment): the single mutator. Given a treatment name,
+// - applyDisplayMode(mesh, mode): the single mutator. Given a display mode,
 //   sets all relevant material/visibility/depth properties, derived from the
 //   current sliderRegionOpacity and atlas. Every code path that mutates a mesh's
 //   visual state goes through this function — there is no other place that
@@ -821,13 +821,13 @@ function buildFresnelMaterial(origMaterial) {
   });
 }
 
-// Pure policy: which treatment should this mesh have given the active set?
+// Pure policy: which display mode should this mesh have given the active set?
 // Returns one of:
 //   'active'     — spotlight (visible, opacity from slider, depthWrite if opaque).
 //   'glass'      — translucent original material; currently only Allen root.
 //   'silhouette' — fresnel-rim outline; currently only non-active macaque root.
 //   'hidden'     — mesh.visible = false; everything else not in the active set.
-function decideTreatment(meshId, activeIds) {
+function decideDisplayMode(meshId, activeIds) {
   const isAllen = activeAtlas.coordSystem === 'allen';
   const isRoot = meshId === meshManifest.root_id;
   // Allen root is always glass, regardless of selection state.
@@ -840,16 +840,16 @@ function decideTreatment(meshId, activeIds) {
   return 'hidden';
 }
 
-// Single mutator. Apply a treatment to a mesh, deriving all properties from
-// current sliderRegionOpacity and atlas. Sets mesh.userData.treatment so callers that
-// re-apply (slider handler) can read back the current treatment.
-function treatMesh(mesh, treatment) {
+// Single mutator. Apply a display mode to a mesh, deriving all properties from
+// current sliderRegionOpacity and atlas. Sets mesh.userData.displayMode so callers
+// that re-apply (slider handler) can read back the current mode.
+function applyDisplayMode(mesh, mode) {
   const orig = mesh.userData.originalMaterial;
   if (!orig) return;
   const isAllen = activeAtlas.coordSystem === 'allen';
   const isRoot = mesh.userData.isRoot;
 
-  if (treatment === 'active') {
+  if (mode === 'active') {
     if (sliderRegionOpacity === 0) {
       mesh.visible = false;
     } else {
@@ -867,7 +867,7 @@ function treatMesh(mesh, treatment) {
       mesh.material = mat;
       mesh.visible = true;
     }
-  } else if (treatment === 'glass') {
+  } else if (mode === 'glass') {
     // Allen root only: original (translucent) material at slider-modulated alpha.
     if (sliderRegionOpacity === 0) {
       mesh.visible = false;
@@ -879,7 +879,7 @@ function treatMesh(mesh, treatment) {
       mesh.material = mat;
       mesh.visible = true;
     }
-  } else if (treatment === 'silhouette') {
+  } else if (mode === 'silhouette') {
     // Fresnel-rim outline. Currently only used for non-active macaque root,
     // to provide spatial context without the "fog" that a flat-alpha outline
     // produced.
@@ -889,28 +889,28 @@ function treatMesh(mesh, treatment) {
     mesh.material = mesh.userData.outlineMaterial;
     mesh.renderOrder = -1;
     mesh.visible = true;
-  } else if (treatment === 'hidden') {
+  } else if (mode === 'hidden') {
     // Not drawn. Used for everything not in the active set on Allen, and for
     // macaque non-root meshes not in the active set.
     mesh.visible = false;
   }
 
-  mesh.userData.treatment = treatment;
+  mesh.userData.displayMode = mode;
   // Back-compat: existing readers of `isDimmed` (hover-pickable filter at
-  // ~line 734, region-toggles overlay handler) check this flag. Maintained
-  // as a derived value from `treatment` — true when the mesh is in any
+  // ~line 734, region-visibility overlay handler) check this flag. Maintained
+  // as a derived value from `displayMode` — true when the mesh is in any
   // non-focal state (silhouette or hidden) — so we don't have to update
-  // every reader at once. New code should read `treatment` directly.
-  mesh.userData.isDimmed = (treatment === 'silhouette' || treatment === 'hidden');
+  // every reader at once. New code should read `displayMode` directly.
+  mesh.userData.isDimmed = (mode === 'silhouette' || mode === 'hidden');
 }
 
 // Thin wrappers for existing call sites (e.g. updateDandisetPanel's checkbox
-// handlers). New code should prefer treatMesh(mesh, treatment) directly. The
+// handlers). New code should prefer applyDisplayMode(mesh, mode) directly. The
 // applyDimmed wrapper dispatches to 'hidden' because its callers (right-panel
 // region toggles) only ever target data meshes, never the macaque root.
-function applyActive(mesh)     { treatMesh(mesh, 'active'); }
-function applyDimmed(mesh)     { treatMesh(mesh, 'hidden'); }
-function restoreOriginal(mesh) { treatMesh(mesh, 'glass');  }
+function applyActive(mesh)     { applyDisplayMode(mesh, 'active'); }
+function applyDimmed(mesh)     { applyDisplayMode(mesh, 'hidden'); }
+function restoreOriginal(mesh) { applyDisplayMode(mesh, 'glass');  }
 
 function findNearestAncestorWithMesh(structureId) {
   // Walk up the hierarchy to find the closest ancestor that has a loaded mesh
@@ -930,7 +930,7 @@ function spotlightRegion(structureId) {
 
   // Speculatively pre-load descendant meshes so navigation into the subtree is
   // instant. Note: descendants are NOT made visible in region view (only the
-  // clicked mesh is — see applyMeshTreatments). The pre-load is a cache warm,
+  // clicked mesh is — see syncSceneToSelection). The pre-load is a cache warm,
   // not a visibility decision.
   const subtreeIds = getDescendantIds(structureId);
   if (targetId != null) subtreeIds.add(targetId);
@@ -940,47 +940,48 @@ function spotlightRegion(structureId) {
       toLoad.push(ensureMeshLoaded(id));
     }
   }
-  Promise.all(toLoad).then(() => applyMeshTreatments(activeSet));
+  Promise.all(toLoad).then(() => syncSceneToSelection(activeSet));
 
   // Apply immediately to already-loaded meshes
-  applyMeshTreatments(activeSet);
+  syncSceneToSelection(activeSet);
 }
 
-// Scene-level visibility orchestrator. Iterates every loaded mesh and
-// dispatches each to the appropriate per-mesh primitive (applyActive,
-// applyDimmed, restoreOriginal) based on the active set and the current
-// atlas. This single function is called by every view that changes
-// scene state — region view, dandiset view, session view, tree-filter
-// view — so the visibility policy lives in exactly one place.
+// Scene-level orchestrator. Brings every loaded mesh's display mode into
+// sync with the given selection: walks meshObjects, asks decideDisplayMode
+// for each mesh's intended mode, optionally demotes 'active' to 'hidden'
+// when the user-override callback says so, and dispatches to applyDisplayMode
+// to mutate the material. This single function is called by every view that
+// changes scene state — region, dandiset, subject, session, atlas init — so
+// the visibility policy lives in exactly one place.
 //
-// activeIds: Set of structure IDs that should be treated as "active"
-// (rendered with applyActive). For region view this is a singleton; for
-// dandiset/session views it's the set of regions covered by the
-// dandiset/session. For the atlas init view it contains just the root.
+// activeIds: Set of structure IDs that should be displayed as 'active'.
+// For region view this is a singleton; for dandiset/subject/session views
+// it's the set of regions covered by the dandiset/subject/session. For the
+// atlas init view it contains just the root.
 //
-// isMeshHidden: optional callback (meshId) => boolean. If provided and
-// returns true for a given mesh, the mesh is dimmed even if it's in
-// activeIds. Used by the dandiset/session view to honor per-region hide
-// toggles in the right panel.
+// shouldHideMesh: optional callback (meshId) => boolean. If provided and
+// returns true for a given mesh, the mesh's mode is demoted to 'hidden'
+// even if it's in activeIds. Used by dandiset/subject/session views to
+// honor per-region visibility toggles in the right-panel overlay.
 //
-// Treatment dispatch:
-// - Allen root: always glass via restoreOriginal, regardless of selection.
-// - Macaque root in activeIds (atlas init view only): solid opaque via applyActive.
-// - Macaque root not in activeIds: fresnel rim via applyDimmed.
-// - Active data mesh (and not user-hidden): applyActive.
-// - Active data mesh that is user-hidden: applyDimmed.
-// - Non-active mesh: applyDimmed (hidden on Allen, hidden on macaque non-root too).
-function applyMeshTreatments(activeIds, isMeshHidden = null) {
+// Display mode dispatch (per mesh, computed by decideDisplayMode):
+// - Allen root: always 'glass', regardless of selection.
+// - Macaque root in activeIds (atlas init view only): 'active' (solid opaque).
+// - Macaque root not in activeIds: 'silhouette' (fresnel rim).
+// - Active data mesh (and not user-hidden): 'active'.
+// - Active data mesh that is user-hidden: 'hidden'.
+// - Non-active mesh: 'hidden' (on both atlases).
+function syncSceneToSelection(activeIds, shouldHideMesh = null) {
   for (const [idStr, mesh] of Object.entries(meshObjects)) {
     const id = parseInt(idStr);
-    let treatment = decideTreatment(id, activeIds);
+    let mode = decideDisplayMode(id, activeIds);
     // Honor per-region user hide toggles (right-panel checkboxes): demote
-    // an 'active' treatment to 'hidden' when the caller says this mesh is
+    // an 'active' display mode to 'hidden' when the caller says this mesh is
     // user-hidden.
-    if (treatment === 'active' && isMeshHidden && isMeshHidden(id)) {
-      treatment = 'hidden';
+    if (mode === 'active' && shouldHideMesh && shouldHideMesh(id)) {
+      mode = 'hidden';
     }
-    treatMesh(mesh, treatment);
+    applyDisplayMode(mesh, mode);
   }
 }
 
@@ -1058,65 +1059,51 @@ function updateTreeBadges() {
   });
 }
 
-async function selectDandiset(dandisetId, { pushState = true } = {}) {
-  selectedDandiset = dandisetId;
-  selectedId = null;
-  dandisetRegionFilter = null;
-  dandisetSubjectCounts = computeDandisetSubjectCounts(dandisetId);
-  hiddenRegionIds = new Set();
-  currentView = 'dandiset';
-  clearElectrodePoints();
+async function enterDandisetView(dandisetId, { pushState = true } = {}) {
+  return transitionView('dandiset', async () => {
+    selectedDandiset = dandisetId;
+    selectedId = null;
+    dandisetSubjectCounts = computeDandisetSubjectCounts(dandisetId);
+    hiddenRegionIds = new Set();
+    clearElectrodePoints();
 
-  // Update URL hash
-  if (pushState) {
-    setHash(`dandiset=${dandisetId}`);
-  }
+    if (pushState) setHash(`dandiset=${dandisetId}`);
 
-  // Deselect tree
-  const prevEl = document.querySelector('.tree-node-content.selected');
-  if (prevEl) prevEl.classList.remove('selected');
+    const structureIds = dandisetToStructures[dandisetId] || [];
+    const activeSet = new Set(structureIds);
 
-  const structureIds = dandisetToStructures[dandisetId] || [];
-  const activeSet = new Set(structureIds);
-
-  // Ensure meshes are loaded for all structures in this dandiset
-  const toLoad = [];
-  for (const sid of structureIds) {
-    if (!meshObjects[sid] && !failedMeshIds.has(sid) && !noMeshIds.has(sid)) {
-      toLoad.push(ensureMeshLoaded(sid));
+    // Ensure meshes are loaded for all structures in this dandiset
+    const toLoad = [];
+    for (const sid of structureIds) {
+      if (!meshObjects[sid] && !failedMeshIds.has(sid) && !noMeshIds.has(sid)) {
+        toLoad.push(ensureMeshLoaded(sid));
+      }
     }
-  }
-  if (toLoad.length > 0) {
-    await Promise.all(toLoad);
-  }
+    if (toLoad.length > 0) await Promise.all(toLoad);
 
-  // Build mapping: meshId -> [regionIds it represents]
-  const meshToRegions = new Map();
-  for (const sid of structureIds) {
-    const meshId = meshObjects[sid] ? sid : findNearestAncestorWithMesh(sid);
-    if (meshId) {
-      activeSet.add(meshId);
-      if (!meshToRegions.has(meshId)) meshToRegions.set(meshId, []);
-      meshToRegions.get(meshId).push(sid);
+    // Build mapping: meshId -> [regionIds it represents]
+    const meshToRegions = new Map();
+    for (const sid of structureIds) {
+      const meshId = meshObjects[sid] ? sid : findNearestAncestorWithMesh(sid);
+      if (meshId) {
+        activeSet.add(meshId);
+        if (!meshToRegions.has(meshId)) meshToRegions.set(meshId, []);
+        meshToRegions.get(meshId).push(sid);
+      }
     }
-  }
 
-  // Apply scene visibility: active regions get applyActive, root gets
-  // atlas-appropriate treatment, everything else is hidden. Honors per-region
-  // hide toggles via the isMeshHidden callback.
-  applyMeshTreatments(activeSet, (meshId) => {
-    const regions = meshToRegions.get(meshId) || [meshId];
-    return regions.every(rid => hiddenRegionIds.has(rid));
+    // Sync scene: active regions get 'active' display mode, root gets
+    // atlas-appropriate mode, everything else is hidden. Honors per-region
+    // visibility toggles via the shouldHideMesh callback.
+    syncSceneToSelection(activeSet, (meshId) => {
+      const regions = meshToRegions.get(meshId) || [meshId];
+      return regions.every(rid => hiddenRegionIds.has(rid));
+    });
+
+    updateDandisetPanel(dandisetId, structureIds);
+    filterTreeByDandiset(dandisetId);
+    updateTreeBadges();
   });
-
-  // Update right panel to show dandiset info
-  updateDandisetPanel(dandisetId, structureIds);
-
-  // Filter the left panel tree to highlight matching regions
-  filterTreeByDandiset(dandisetId);
-
-  // Update tree badges to show subject counts
-  updateTreeBadges();
 }
 
 function filterTreeByDandiset(dandisetId) {
@@ -1161,60 +1148,84 @@ function filterTreeByDandiset(dandisetId) {
   });
 }
 
+// Cross-cutting boundary discipline that runs on every view transition.
+// Per-view enter*View functions wrap their body in transitionView(newView,
+// () => { ... }) so the shared cleanup happens in exactly one place and
+// currentView gets updated by exactly one writer.
+//
+// What runs BEFORE per-view work:
+// - currentView = newView. Single writer guarantees this categorical state
+//   is always consistent with what just happened.
+// - dandisetRegionFilter = null. Only the dandiset view ever uses this field
+//   to mean anything, and entering any view starts that filter fresh.
+// - Deselect any tree node carrying .selected. Per-view work re-adds it if
+//   the new view wants a node selected (e.g. enterRegionView selects the
+//   target region's node).
+//
+// What stays in per-view work:
+// - selectedId / selectedDandiset writes (each view owns its primary identifier).
+// - hiddenRegionIds reset (different rule per view: reset on init/region/dandiset,
+//   inherit on subject/session).
+// - clearElectrodePoints (region/dandiset/init clear; subject/session re-render
+//   via showElectrodePoints*).
+// - region-visibility-overlay show/hide (dandiset re-shows via panel render;
+//   region/init hide).
+// - Filter bar visibility.
+// - Mesh display modes, panel render, hash push.
+function transitionView(newView, work) {
+  currentView = newView;
+  dandisetRegionFilter = null;
+  const sel = document.querySelector('.tree-node-content.selected');
+  if (sel) sel.classList.remove('selected');
+  return work();
+}
+
 // Reset selection state, DOM overlays, and the 3D scene back to the atlas-init
 // look. Shared by every code path that returns the user to the "no selection"
 // state: the dandiset-filter clear button (clearDandisetFilter) and the
-// no-hash branch of applyHashState (popstate / external hash clear).
+// no-hash branch of applyURLState (popstate / external hash clear).
 //
 // Does NOT touch the URL hash — callers decide whether to push a clean URL
-// (clearDandisetFilter does; applyHashState is reacting to a hash that's
+// (clearDandisetFilter does; applyURLState is reacting to a hash that's
 // already empty).
 //
 // The Allen vs macaque 3D-view split is intentional: showAllRegions restores
 // Allen's "frosted brain" look but on macaque would leak previously loaded
-// region meshes, so macaque routes through selectRegion(root) so only root
+// region meshes, so macaque routes through enterRegionView(root) so only root
 // is visible.
-function restoreInitView() {
-  // Selection state
-  selectedId = null;
-  selectedDandiset = null;
-  dandisetRegionFilter = null;
-  dandisetSubjectCounts = null;
-  hiddenRegionIds = new Set();
-  currentView = 'init';
+function enterInitView() {
+  transitionView('init', () => {
+    selectedId = null;
+    selectedDandiset = null;
+    dandisetSubjectCounts = null;
+    hiddenRegionIds = new Set();
 
-  // Scene-side overlays
-  clearElectrodePoints();
-  document.getElementById('region-toggles-overlay').classList.add('hidden');
+    clearElectrodePoints();
+    document.getElementById('region-visibility-overlay').classList.add('hidden');
+    document.getElementById('dandiset-filter-bar').classList.add('hidden');
+    hideSubjectFilter();
 
-  // Filter bars
-  document.getElementById('dandiset-filter-bar').classList.add('hidden');
-  hideSubjectFilter();
+    // Tree: strip dandiset filter classes (selected node already deselected by transitionView)
+    const tree = document.getElementById('hierarchy-tree');
+    tree.querySelectorAll('.dandiset-inactive').forEach(el => el.classList.remove('dandiset-inactive'));
+    tree.querySelectorAll('.dandiset-active').forEach(el => el.classList.remove('dandiset-active'));
 
-  // Tree: deselect any selected node, strip dandiset filter classes
-  const tree = document.getElementById('hierarchy-tree');
-  const sel = tree.querySelector('.tree-node-content.selected');
-  if (sel) sel.classList.remove('selected');
-  tree.querySelectorAll('.dandiset-inactive').forEach(el => el.classList.remove('dandiset-inactive'));
-  tree.querySelectorAll('.dandiset-active').forEach(el => el.classList.remove('dandiset-active'));
+    // 3D scene
+    if (activeAtlas.coordSystem === 'allen') {
+      showAllRegions();
+    } else if (meshManifest && meshManifest.root_id != null) {
+      enterRegionView(meshManifest.root_id, { pushState: false, expandTree: false });
+    }
 
-  // 3D scene
-  if (activeAtlas.coordSystem === 'allen') {
-    showAllRegions();
-  } else if (meshManifest && meshManifest.root_id != null) {
-    selectRegion(meshManifest.root_id, { pushState: false, expandTree: false });
-  }
+    updateTreeBadges();
 
-  // Tree badges back to dandiset counts (subject-count mode is dandiset-scoped)
-  updateTreeBadges();
-
-  // Right panel placeholder
-  document.getElementById('region-panel').innerHTML =
-    '<p class="placeholder-text">Click a brain region to view details and associated DANDI datasets.</p>';
+    document.getElementById('region-panel').innerHTML =
+      '<p class="placeholder-text">Click a brain region to view details and associated DANDI datasets.</p>';
+  });
 }
 
 function clearDandisetFilter() {
-  restoreInitView();
+  enterInitView();
   history.pushState(null, '', window.location.pathname);
 }
 
@@ -1370,17 +1381,17 @@ async function updateDandisetPanel(dandisetId, structureIds) {
       }).sort((a, b) => a.name.localeCompare(b.name));
 
       // Render region toggles into the 3D viewer overlay
-      const toggleOverlay = document.getElementById('region-toggles-overlay');
+      const toggleOverlay = document.getElementById('region-visibility-overlay');
       if (regionList.length > 0) {
         const wasCollapsed = toggleOverlay.classList.contains('collapsed');
-        let toggleHtml = `<div class="region-toggles-header"><label class="region-toggle-all-label"><input type="checkbox" id="toggle-all-regions"> Brain Regions (${regionList.length})</label><button class="region-toggles-collapse-btn" title="Collapse">${wasCollapsed ? '&#x25B6;' : '&#x25BC;'}</button></div>`;
-        toggleHtml += `<div class="region-toggle-list">`;
+        let toggleHtml = `<div class="region-visibility-header"><label class="region-visibility-all-label"><input type="checkbox" id="toggle-all-region-visibility"> Brain Regions (${regionList.length})</label><button class="region-visibility-collapse-btn" title="Collapse">${wasCollapsed ? '&#x25B6;' : '&#x25BC;'}</button></div>`;
+        toggleHtml += `<div class="region-visibility-list">`;
         for (const r of regionList) {
           const checked = !hiddenRegionIds.has(r.id);
-          toggleHtml += `<label class="region-toggle-row" title="${r.name}">`;
+          toggleHtml += `<label class="region-visibility-row" title="${r.name}">`;
           toggleHtml += `<input type="checkbox" data-region-id="${r.id}" ${checked ? 'checked' : ''}>`;
-          toggleHtml += `<span class="region-toggle-dot" style="background:#${r.color}"></span>`;
-          toggleHtml += `<span class="region-toggle-name">${r.acronym || r.name}</span>`;
+          toggleHtml += `<span class="region-visibility-dot" style="background:#${r.color}"></span>`;
+          toggleHtml += `<span class="region-visibility-name">${r.acronym || r.name}</span>`;
           toggleHtml += `</label>`;
         }
         toggleHtml += `</div>`;
@@ -1489,10 +1500,14 @@ async function updateDandisetPanel(dandisetId, structureIds) {
   }
 
   function attachCardListeners() {
-    // Expand/collapse for multi-session subject cards
+    // Multi-session subject card: expand/collapse the inline session list,
+    // then route to enterSubjectView. The expand/collapse is panel chrome
+    // (specific to this card layout); the navigation work lives in
+    // enterSubjectView and is shared with enterSubjectViewFromURL.
     panel.querySelectorAll('.subject-card-expandable').forEach(card => {
       card.addEventListener('click', (e) => {
         if (e.target.closest('.asset-card-ext')) return;
+
         const group = card.closest('.subject-group');
         const sessionList = group.querySelector('.session-list');
         const arrow = card.querySelector('.expand-arrow');
@@ -1507,23 +1522,7 @@ async function updateDandisetPanel(dandisetId, structureIds) {
           arrow.classList.add('expanded');
         }
 
-        const regionIds = JSON.parse(card.dataset.regionIds || '[]');
-        const electrodeAssets = JSON.parse(card.dataset.electrodeAssets || '[]');
-        const subjectDir = card.dataset.subjectDir;
-        const subjectName = card.querySelector('.asset-card-filename')?.textContent || subjectDir.replace(/^sub-/, '');
-
-        dandisetRegionFilter = null;
-        currentView = 'subject';
-        filterTreeByStructureIds(regionIds);
-        showSubjectFilter(`Subject: ${subjectName}`);
-        const selEl = document.querySelector('.tree-node-content.selected');
-        if (selEl) selEl.classList.remove('selected');
-
-        showElectrodePointsForAssets(dandisetId, electrodeAssets, { colorBySession: true });
-        setHash(`dandiset=${dandisetId}&subject=${subjectDir}`);
-
-        spotlightRegions(regionIds);
-        filterRegionToggles(regionIds);
+        enterSubjectView(subjectViewParamsFromCard(card, dandisetId));
 
         panel.querySelectorAll('.asset-card').forEach(c => c.classList.remove('asset-card-selected'));
         panel.querySelectorAll('.session-row').forEach(r => r.classList.remove('session-row-selected'));
@@ -1531,31 +1530,10 @@ async function updateDandisetPanel(dandisetId, structureIds) {
       });
     });
 
-    // Click on session rows within expanded subject cards
+    // Session row inside an expanded subject group: route to enterSessionView.
     panel.querySelectorAll('.session-row').forEach(row => {
       row.addEventListener('click', () => {
-        const regionIds = JSON.parse(row.dataset.regionIds || '[]');
-        const assetId = row.dataset.assetId;
-        const subjectDir = row.dataset.subjectDir;
-        const sessionLabel = row.querySelector('.session-row-label')?.textContent || '';
-
-        dandisetRegionFilter = null;
-        currentView = 'session';
-        filterTreeByStructureIds(regionIds);
-        showSubjectFilter(`${subjectDir.replace(/^sub-/, '')} / ${sessionLabel}`);
-        const selEl = document.querySelector('.tree-node-content.selected');
-        if (selEl) selEl.classList.remove('selected');
-
-        if (assetId) {
-          showElectrodePoints(dandisetId, assetId);
-          setHash(`dandiset=${dandisetId}&subject=${subjectDir}&session=${assetId}`);
-        } else {
-          clearElectrodePoints();
-          setHash(`dandiset=${dandisetId}&subject=${subjectDir}`);
-        }
-
-        spotlightRegions(regionIds);
-        filterRegionToggles(regionIds);
+        enterSessionView(sessionViewParamsFromRow(row, dandisetId));
 
         panel.querySelectorAll('.asset-card').forEach(c => c.classList.remove('asset-card-selected'));
         panel.querySelectorAll('.session-row').forEach(r => r.classList.remove('session-row-selected'));
@@ -1563,51 +1541,54 @@ async function updateDandisetPanel(dandisetId, structureIds) {
       });
     });
 
-    // Click on single-session subject cards and "All Subjects"
+    // Single-session subject card or "All Subjects" card. The "All Subjects"
+    // branch is structurally a return-to-dandiset-view (not a subject/session
+    // entry) so it stays inline rather than going through enterSubjectView.
+    // The single-session subject branch routes to enterSessionView (assetId
+    // present) or enterSubjectView (assetId absent).
     panel.querySelectorAll('.asset-card:not(.subject-card-expandable)').forEach(card => {
       card.addEventListener('click', (e) => {
         if (e.target.closest('.asset-card-ext')) return;
-        const regionIds = JSON.parse(card.dataset.regionIds || '[]');
 
         if (card.dataset.all) {
+          // "All Subjects" — return to the full dandiset view from a subject /
+          // session / region-filter sub-state. Routes through transitionView
+          // so currentView and the cross-cutting cleanup land in one place.
           const hadRegionFilter = dandisetRegionFilter !== null;
-          dandisetRegionFilter = null;
-          currentView = 'dandiset';
-          filterTreeByDandiset(dandisetId);
-          hideSubjectFilter();
-          clearElectrodePoints();
-          setHash(`dandiset=${dandisetId}`);
-          const selEl = document.querySelector('.tree-node-content.selected');
-          if (selEl) selEl.classList.remove('selected');
-          if (hadRegionFilter) {
-            spotlightRegions(structureIds);
-            updateDandisetPanel(dandisetId, structureIds);
-            const newAllCard = panel.querySelector('.asset-card[data-all]');
-            if (newAllCard) newAllCard.classList.add('asset-card-selected');
-            return;
-          }
-        } else {
-          dandisetRegionFilter = null;
-          // Single-session subject card: with assetId it's a session view,
-          // without it's a subject view (no specific session selected).
-          currentView = card.dataset.assetId ? 'session' : 'subject';
-          const subjectName = card.querySelector('.asset-card-filename')?.textContent || '';
-          filterTreeByStructureIds(regionIds);
-          showSubjectFilter(`Subject: ${subjectName}`);
-          const selEl = document.querySelector('.tree-node-content.selected');
-          if (selEl) selEl.classList.remove('selected');
-          const assetId = card.dataset.assetId;
-          const subjectDir = card.dataset.subjectDir;
-          if (assetId) {
-            showElectrodePoints(dandisetId, assetId);
-            setHash(`dandiset=${dandisetId}&subject=${subjectDir}&session=${assetId}`);
-          } else {
+          transitionView('dandiset', () => {
+            filterTreeByDandiset(dandisetId);
+            hideSubjectFilter();
             clearElectrodePoints();
             setHash(`dandiset=${dandisetId}`);
-          }
+            if (hadRegionFilter) {
+              spotlightRegions(structureIds);
+              updateDandisetPanel(dandisetId, structureIds);
+              const newAllCard = panel.querySelector('.asset-card[data-all]');
+              if (newAllCard) newAllCard.classList.add('asset-card-selected');
+              return;
+            }
+            spotlightRegions(JSON.parse(card.dataset.regionIds || '[]'));
+            filterRegionVisibilityRows(null);
+          });
+          if (hadRegionFilter) return;
+        } else if (card.dataset.assetId) {
+          enterSessionView({
+            dandisetId,
+            subjectDir: card.dataset.subjectDir,
+            assetId: card.dataset.assetId,
+            regionIds: JSON.parse(card.dataset.regionIds || '[]'),
+            sessionLabel: '',
+          });
+        } else {
+          enterSubjectView({
+            dandisetId,
+            subjectDir: card.dataset.subjectDir,
+            regionIds: JSON.parse(card.dataset.regionIds || '[]'),
+            electrodeAssets: [],
+            subjectName: card.querySelector('.asset-card-filename')?.textContent
+              || (card.dataset.subjectDir || '').replace(/^sub-/, ''),
+          });
         }
-        spotlightRegions(regionIds);
-        filterRegionToggles(card.dataset.all ? null : regionIds);
 
         panel.querySelectorAll('.asset-card').forEach(c => c.classList.remove('asset-card-selected'));
         panel.querySelectorAll('.session-row').forEach(r => r.classList.remove('session-row-selected'));
@@ -1633,12 +1614,12 @@ async function updateDandisetPanel(dandisetId, structureIds) {
     }
 
     // After updating hiddenRegionIds, update the mesh for a given region
-    function applyToggleToMesh(rid) {
+    function applyVisibilityToMesh(rid) {
       const meshId = meshIdForRegion(rid);
       if (!meshId || !meshObjects[meshId]) return;
-      const overlay = document.getElementById('region-toggles-overlay');
+      const overlay = document.getElementById('region-visibility-overlay');
       // Check if ANY visible toggle region sharing this mesh is still checked
-      const shouldShow = [...overlay.querySelectorAll('.region-toggle-row:not(.toggle-hidden) input[type="checkbox"]')].some(otherCb => {
+      const shouldShow = [...overlay.querySelectorAll('.region-visibility-row:not(.row-filtered) input[type="checkbox"]')].some(otherCb => {
         const otherRid = parseInt(otherCb.dataset.regionId);
         if (hiddenRegionIds.has(otherRid)) return false;
         return meshIdForRegion(otherRid) === meshId;
@@ -1650,8 +1631,8 @@ async function updateDandisetPanel(dandisetId, structureIds) {
       }
     }
 
-    const overlay = document.getElementById('region-toggles-overlay');
-    overlay.querySelectorAll('.region-toggle-row input[type="checkbox"]').forEach(cb => {
+    const overlay = document.getElementById('region-visibility-overlay');
+    overlay.querySelectorAll('.region-visibility-row input[type="checkbox"]').forEach(cb => {
       cb.addEventListener('change', () => {
         const rid = parseInt(cb.dataset.regionId);
         if (cb.checked) {
@@ -1659,12 +1640,12 @@ async function updateDandisetPanel(dandisetId, structureIds) {
         } else {
           hiddenRegionIds.add(rid);
         }
-        applyToggleToMesh(rid);
-        filterRegionToggles();  // update toggle-all state
+        applyVisibilityToMesh(rid);
+        filterRegionVisibilityRows();  // update toggle-all state
       });
     });
 
-    const collapseBtn = overlay.querySelector('.region-toggles-collapse-btn');
+    const collapseBtn = overlay.querySelector('.region-visibility-collapse-btn');
     if (collapseBtn) {
       collapseBtn.addEventListener('click', (e) => {
         e.preventDefault();
@@ -1673,14 +1654,14 @@ async function updateDandisetPanel(dandisetId, structureIds) {
       });
     }
 
-    const toggleAll = overlay.querySelector('#toggle-all-regions');
+    const toggleAll = overlay.querySelector('#toggle-all-region-visibility');
     if (toggleAll) {
-      filterRegionToggles();  // set initial toggle-all state
+      filterRegionVisibilityRows();  // set initial toggle-all state
       toggleAll.addEventListener('change', () => {
         const checked = toggleAll.checked;
         // Collect affected mesh IDs to update after all checkboxes are set
         const affectedMeshIds = new Set();
-        overlay.querySelectorAll('.region-toggle-row:not(.toggle-hidden) input[type="checkbox"]').forEach(cb => {
+        overlay.querySelectorAll('.region-visibility-row:not(.row-filtered) input[type="checkbox"]').forEach(cb => {
           const rid = parseInt(cb.dataset.regionId);
           cb.checked = checked;
           if (checked) {
@@ -1764,37 +1745,37 @@ async function spotlightRegions(structureIds) {
   }
 
   // Apply scene visibility: active regions get applyActive, root gets atlas-
-  // appropriate treatment (Allen=glass, macaque=silhouette), everything else
-  // is hidden. Honors per-region hide toggles via the isMeshHidden callback.
-  applyMeshTreatments(activeSet, (meshId) => {
+  // appropriate display mode (Allen=glass, macaque=silhouette), everything else
+  // is hidden. Honors per-region hide toggles via the shouldHideMesh callback.
+  syncSceneToSelection(activeSet, (meshId) => {
     const regions = meshToRegions.get(meshId) || [meshId];
     return regions.every(rid => hiddenRegionIds.has(rid));
   });
 }
 
-function filterRegionToggles(regionIds) {
-  const overlay = document.getElementById('region-toggles-overlay');
+function filterRegionVisibilityRows(regionIds) {
+  const overlay = document.getElementById('region-visibility-overlay');
   const activeSet = regionIds ? new Set(regionIds) : null;
   let visibleCount = 0;
-  const rows = overlay.querySelectorAll('.region-toggle-row');
+  const rows = overlay.querySelectorAll('.region-visibility-row');
   rows.forEach(row => {
     const rid = parseInt(row.querySelector('input[type="checkbox"]').dataset.regionId);
     if (!activeSet || activeSet.has(rid)) {
-      row.classList.remove('toggle-hidden');
+      row.classList.remove('row-filtered');
       visibleCount++;
     } else {
-      row.classList.add('toggle-hidden');
+      row.classList.add('row-filtered');
     }
   });
-  const headerLabel = overlay.querySelector('.region-toggle-all-label');
+  const headerLabel = overlay.querySelector('.region-visibility-all-label');
   if (headerLabel) {
     const total = rows.length;
     headerLabel.lastChild.textContent = ` Brain Regions (${activeSet ? visibleCount : total})`;
   }
   // Update toggle-all checkbox state
-  const ta = overlay.querySelector('#toggle-all-regions');
+  const ta = overlay.querySelector('#toggle-all-region-visibility');
   if (ta) {
-    const cbs = [...overlay.querySelectorAll('.region-toggle-row:not(.toggle-hidden) input[type="checkbox"]')];
+    const cbs = [...overlay.querySelectorAll('.region-visibility-row:not(.row-filtered) input[type="checkbox"]')];
     if (cbs.length === 0) { ta.checked = false; ta.indeterminate = false; }
     else {
       const allChecked = cbs.every(c => c.checked);
@@ -1805,14 +1786,85 @@ function filterRegionToggles(regionIds) {
   }
 }
 
-function selectSubjectByDir(dandisetId, subjectDir, sessionAssetId) {
+// Enter the subject view: a dandiset's recordings narrowed to one subject.
+// Updates state, scene, tree filter, electrodes, URL hash, and visibility
+// overlay. Does NOT touch panel-card selection styling — callers (the
+// inline click handlers in attachCardListeners and enterSubjectViewFromURL) own
+// that because it depends on which DOM element was the click target.
+function enterSubjectView({ dandisetId, subjectDir, regionIds, electrodeAssets, subjectName }) {
+  transitionView('subject', () => {
+    filterTreeByStructureIds(regionIds);
+    showSubjectFilter(`Subject: ${subjectName}`);
+
+    showElectrodePointsForAssets(dandisetId, electrodeAssets, { colorBySession: true });
+    setHash(`dandiset=${dandisetId}&subject=${subjectDir}`);
+
+    spotlightRegions(regionIds);
+    filterRegionVisibilityRows(regionIds);
+  });
+}
+
+// Enter the session view: a single recording session (asset) within a subject.
+// Same shape as enterSubjectView but renders single-session electrodes and
+// includes the session asset ID in the URL hash. If assetId is missing the
+// view degrades to "subject" semantics (no electrodes); kept on this entry
+// point so the single-session-card click can route through it without a
+// per-case branch.
+function enterSessionView({ dandisetId, subjectDir, assetId, regionIds, sessionLabel }) {
+  transitionView('session', () => {
+    filterTreeByStructureIds(regionIds);
+    showSubjectFilter(`${subjectDir.replace(/^sub-/, '')} / ${sessionLabel}`);
+
+    if (assetId) {
+      showElectrodePoints(dandisetId, assetId);
+      setHash(`dandiset=${dandisetId}&subject=${subjectDir}&session=${assetId}`);
+    } else {
+      clearElectrodePoints();
+      setHash(`dandiset=${dandisetId}&subject=${subjectDir}`);
+    }
+
+    spotlightRegions(regionIds);
+    filterRegionVisibilityRows(regionIds);
+  });
+}
+
+// Helpers: extract enterSubjectView/enterSessionView params from a panel
+// DOM element. Used by both the inline click handlers and enterSubjectViewFromURL
+// so all four entry paths read the same data attributes the same way.
+function subjectViewParamsFromCard(card, dandisetId) {
+  return {
+    dandisetId,
+    subjectDir: card.dataset.subjectDir,
+    regionIds: JSON.parse(card.dataset.regionIds || '[]'),
+    electrodeAssets: JSON.parse(card.dataset.electrodeAssets || '[]'),
+    subjectName: card.querySelector('.asset-card-filename')?.textContent
+      || (card.dataset.subjectDir || '').replace(/^sub-/, ''),
+  };
+}
+
+function sessionViewParamsFromRow(row, dandisetId) {
+  return {
+    dandisetId,
+    subjectDir: row.dataset.subjectDir,
+    assetId: row.dataset.assetId,
+    regionIds: JSON.parse(row.dataset.regionIds || '[]'),
+    sessionLabel: row.querySelector('.session-row-label')?.textContent || '',
+  };
+}
+
+// Deep-link entry point. Called from applyURLState when the URL contains
+// &subject= (and optionally &session=). Looks up the matching DOM element
+// in the dandiset panel (rendered by the prior enterDandisetView call) and
+// calls enterSubjectView / enterSessionView directly. Replaces the prior
+// pattern of synthesizing element.click() to delegate to inline handlers.
+function enterSubjectViewFromURL(dandisetId, subjectDir, sessionAssetId) {
   const panel = document.getElementById('region-panel');
 
-  // If a specific session asset is requested, find and click the session row
+  // Specific session: find the row, expand the parent group for visibility,
+  // route to enterSessionView.
   if (sessionAssetId) {
     const sessionRow = panel.querySelector(`.session-row[data-asset-id="${sessionAssetId}"]`);
     if (sessionRow) {
-      // Expand the parent subject group first
       const group = sessionRow.closest('.subject-group');
       if (group) {
         group.classList.add('expanded');
@@ -1821,17 +1873,20 @@ function selectSubjectByDir(dandisetId, subjectDir, sessionAssetId) {
         if (sessionList) sessionList.classList.remove('hidden');
         if (arrow) arrow.classList.add('expanded');
       }
-      sessionRow.click();
+      enterSessionView(sessionViewParamsFromRow(sessionRow, dandisetId));
+      panel.querySelectorAll('.asset-card').forEach(c => c.classList.remove('asset-card-selected'));
+      panel.querySelectorAll('.session-row').forEach(r => r.classList.remove('session-row-selected'));
+      sessionRow.classList.add('session-row-selected');
       return;
     }
   }
 
-  // Fall back to selecting the subject card (single-session or expandable)
+  // Subject only: find the subject card.
   const card = panel.querySelector(`.asset-card[data-subject-dir="${subjectDir}"]`);
   if (!card) return;
 
   if (card.classList.contains('subject-card-expandable')) {
-    // Expand multi-session card
+    // Multi-session subject: expand and enter subject view.
     const group = card.closest('.subject-group');
     if (group) {
       group.classList.add('expanded');
@@ -1840,10 +1895,22 @@ function selectSubjectByDir(dandisetId, subjectDir, sessionAssetId) {
       if (sessionList) sessionList.classList.remove('hidden');
       if (arrow) arrow.classList.add('expanded');
     }
+    enterSubjectView(subjectViewParamsFromCard(card, dandisetId));
   } else {
-    // Single-session card: click to select
-    card.click();
+    // Single-session card: assetId presence selects between session and subject view.
+    const assetId = card.dataset.assetId;
+    const regionIds = JSON.parse(card.dataset.regionIds || '[]');
+    const subjectName = card.querySelector('.asset-card-filename')?.textContent || '';
+    if (assetId) {
+      enterSessionView({ dandisetId, subjectDir, assetId, regionIds, sessionLabel: '' });
+    } else {
+      enterSubjectView({ dandisetId, subjectDir, regionIds, electrodeAssets: [], subjectName });
+    }
   }
+
+  panel.querySelectorAll('.asset-card').forEach(c => c.classList.remove('asset-card-selected'));
+  panel.querySelectorAll('.session-row').forEach(r => r.classList.remove('session-row-selected'));
+  card.classList.add('asset-card-selected');
 }
 
 // ── Electrode Points ───────────────────────────────────────────────────────
@@ -1974,47 +2041,37 @@ function clearElectrodePoints() {
   document.getElementById('electrode-control-row').classList.add('hidden');
 }
 
-function selectRegion(structureId, { expandTree = true, pushState = true } = {}) {
-  // Deselect previous
-  if (selectedId !== null) {
-    unhighlightMesh(selectedId);
-    const prevEl = document.querySelector(`.tree-node-content[data-id="${selectedId}"]`);
-    if (prevEl) prevEl.classList.remove('selected');
-  }
+function enterRegionView(structureId, { expandTree = true, pushState = true } = {}) {
+  // The atlas-init view is "enterRegionView(root)" — same code path, different
+  // categorical view. Compute newView before transitionView so the wrapper
+  // sets currentView correctly.
+  const newView = (structureId === meshManifest.root_id) ? 'init' : 'region';
+  transitionView(newView, () => {
+    // Drop the highlight tint from the previously selected region (if any).
+    // The .selected tree-node class is already cleared by transitionView.
+    if (selectedId !== null) unhighlightMesh(selectedId);
 
-  selectedId = structureId;
-  selectedDandiset = null;
-  hiddenRegionIds = new Set();
-  // The atlas-init view is "selectRegion(root)" — same code path, different
-  // categorical view. Flag it explicitly so callers can distinguish.
-  currentView = (structureId === meshManifest.root_id) ? 'init' : 'region';
-  document.getElementById('region-toggles-overlay').classList.add('hidden');
-  clearElectrodePoints();
+    selectedId = structureId;
+    selectedDandiset = null;
+    hiddenRegionIds = new Set();
+    document.getElementById('region-visibility-overlay').classList.add('hidden');
+    clearElectrodePoints();
 
-  // Update URL hash
-  if (pushState) {
-    setHash(`region=${structureId}`);
-  }
+    if (pushState) setHash(`region=${structureId}`);
 
-  // Isolate this region in the 3D view, then highlight
-  spotlightRegion(structureId);
-  highlightMesh(structureId);
+    spotlightRegion(structureId);
+    highlightMesh(structureId);
 
-  // Update tree selection
-  if (expandTree) {
-    expandToNode(structureId);
-  }
-  // Query after expandToNode so lazily-rendered nodes exist in DOM
-  const el = document.querySelector(`.tree-node-content[data-id="${structureId}"]`);
-  if (el) {
-    el.classList.add('selected');
-    if (expandTree) {
-      el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    if (expandTree) expandToNode(structureId);
+    // Query after expandToNode so lazily-rendered nodes exist in DOM
+    const el = document.querySelector(`.tree-node-content[data-id="${structureId}"]`);
+    if (el) {
+      el.classList.add('selected');
+      if (expandTree) el.scrollIntoView({ behavior: 'smooth', block: 'center' });
     }
-  }
 
-  // Update right panel
-  updateRegionPanel(structureId);
+    updateRegionPanel(structureId);
+  });
 }
 
 // ── Region Panel (Right Sidebar) ───────────────────────────────────────────
@@ -2111,7 +2168,7 @@ function updateRegionPanel(structureId) {
     panel.querySelectorAll('.dandiset-card').forEach(card => {
       card.addEventListener('click', (e) => {
         if (e.target.closest('.dandiset-card-ext')) return;
-        selectDandiset(card.dataset.dandisetId);
+        enterDandisetView(card.dataset.dandisetId);
       });
     });
 
@@ -2217,7 +2274,7 @@ function createTreeNode(node, depth) {
       if (selectedDandiset) {
         filterDandisetPanelByRegion(node.id);
       } else {
-        selectRegion(node.id, { expandTree: false });
+        enterRegionView(node.id, { expandTree: false });
       }
       ensureMeshLoaded(node.id);
     });
@@ -2227,7 +2284,7 @@ function createTreeNode(node, depth) {
       if (selectedDandiset) {
         filterDandisetPanelByRegion(node.id);
       } else {
-        selectRegion(node.id, { expandTree: false });
+        enterRegionView(node.id, { expandTree: false });
       }
       ensureMeshLoaded(node.id);
     });
@@ -2480,88 +2537,119 @@ document.getElementById('electrode-opacity').addEventListener('input', (e) => {
 
 document.getElementById('region-opacity').addEventListener('input', (e) => {
   sliderRegionOpacity = parseFloat(e.target.value);
-  // Re-apply each mesh's CURRENT treatment using the new sliderRegionOpacity. The
-  // slider doesn't decide policy (that's decideTreatment's job, run once
-  // when the selection changes); it just refreshes whatever role each mesh
-  // is already playing. treatMesh derives all property values (opacity,
-  // transparent, depthWrite, visible) from the new sliderRegionOpacity, so the
-  // slider can never leave a mesh in an inconsistent state.
+  // In-place opacity update on each non-dimmed mesh's existing material.
+  // Deliberately does NOT re-run applyDisplayMode and does NOT touch
+  // depthWrite. Reason: applyDisplayMode for 'active' sets
+  // `depthWrite = sliderRegionOpacity >= 1`, which turns depth writes off as
+  // soon as the user drags the slider below 1. Without depth writes, Three.js
+  // falls back to sort-by-mesh-center for transparent rendering, which
+  // produces wrong layering when meshes overlap volumetrically (e.g. the
+  // hippocampus mesh ends up behind a larger surrounding region whose center
+  // is closer to the camera). Production main avoids this by leaving
+  // depthWrite at whatever applyDisplayMode set on the last selection change
+  // (true at slider=1, the entry value). The cost of leaving depthWrite=true
+  // is that geometry strictly inside the active mesh (e.g. electrodes inside
+  // a region) gets culled by the depth test even at low alpha; that's an
+  // accepted trade-off, see [[depth_rendering_issues]] and the PR #17
+  // discussion. Revisit if we adopt order-independent transparency or a
+  // hierarchy-aware renderOrder scheme.
   for (const mesh of Object.values(meshObjects)) {
-    if (mesh.userData.treatment) {
-      treatMesh(mesh, mesh.userData.treatment);
+    if (mesh.userData.displayMode === 'hidden' || mesh.userData.displayMode === 'silhouette') continue;
+    if (sliderRegionOpacity === 0) {
+      mesh.visible = false;
+      continue;
     }
+    mesh.visible = true;
+    const orig = mesh.userData.originalMaterial;
+    if (!orig) continue;
+    mesh.material.opacity = orig.opacity * sliderRegionOpacity;
+    mesh.material.transparent = mesh.material.opacity < 1;
+    mesh.material.needsUpdate = true;
   }
 });
 
 // ── Dandiset Filter Clear Button ────────────────────────────────────────────
 document.getElementById('dandiset-filter-clear').addEventListener('click', clearDandisetFilter);
 document.getElementById('subject-filter-clear').addEventListener('click', () => {
-  hideSubjectFilter();
-  clearElectrodePoints();
+  // Return-to-dandiset-view from subject / session / region-filter sub-state.
+  // Routes through transitionView so currentView and the cross-cutting cleanup
+  // happen in one place. No-op if no dandiset is selected (subject filter
+  // shouldn't be visible in that case anyway).
+  if (!selectedDandiset) return;
   const hadRegionFilter = dandisetRegionFilter !== null;
-  dandisetRegionFilter = null;
-  // Deselect tree node
-  const selEl = document.querySelector('.tree-node-content.selected');
-  if (selEl) selEl.classList.remove('selected');
-  // Restore to full dandiset view
-  if (selectedDandiset) {
+  transitionView('dandiset', () => {
+    hideSubjectFilter();
+    clearElectrodePoints();
     setHash(`dandiset=${selectedDandiset}`);
+
     filterTreeByDandiset(selectedDandiset);
     const structureIds = dandisetToStructures[selectedDandiset] || [];
     spotlightRegions(structureIds);
-    // Re-render panel if region filter was active, to show all subjects
     if (hadRegionFilter) {
       updateDandisetPanel(selectedDandiset, structureIds);
     }
-    // Deselect subject card and session rows, select "All Subjects"
+    // Card selection: deselect everything, mark "All Subjects" selected.
     const panel = document.getElementById('region-panel');
     panel.querySelectorAll('.asset-card').forEach(c => c.classList.remove('asset-card-selected'));
     panel.querySelectorAll('.session-row').forEach(r => r.classList.remove('session-row-selected'));
     const allCard = panel.querySelector('.asset-card[data-all]');
     if (allCard) allCard.classList.add('asset-card-selected');
-  }
+  });
 });
 
-// ── URL Hash State ──────────────────────────────────────────────────────────
+// ── URL State ──────────────────────────────────────────────────────────────
+//
+// The app's deep-link state lives in the URL hash (`location.hash`):
+//   #region=672                                           → region view
+//   #dandiset=000017                                       → dandiset view
+//   #dandiset=000017&region=672                            → dandiset filtered by region
+//   #dandiset=000017&subject=sub-M1                        → subject view
+//   #dandiset=000017&subject=sub-M1&session=<assetId>      → session view
+//   (empty)                                                → atlas init view
+//
+// setHash writes a new URL via pushState so browser back/forward navigates
+// across views. applyURLState reads location.hash and dispatches to the
+// matching enter*View function with pushState:false (so the entry function
+// doesn't re-push the URL it's reacting to).
 function setHash(hash) {
   history.pushState(null, '', '#' + hash);
 }
 
-async function applyHashState() {
-  const hash = location.hash.slice(1); // remove '#'
-  if (!hash) {
+async function applyURLState() {
+  // URLSearchParams handles URL-decoding and edge cases like '=' in values.
+  // location.hash includes the leading '#' which URLSearchParams doesn't want.
+  const params = new URLSearchParams(location.hash.slice(1));
+
+  if (params.size === 0) {
     // No hash — show default (init) view. Guard avoids redundant DOM thrash
     // when a hashchange fires but nothing is actually selected.
     if (selectedId !== null || selectedDandiset !== null) {
-      restoreInitView();
+      enterInitView();
     }
     return;
   }
 
-  const params = Object.fromEntries(hash.split('&').map(p => p.split('=')));
-  if (params.dandiset) {
-    const did = params.dandiset;
-    if (dandisetToStructures[did]) {
-      await selectDandiset(did, { pushState: false });
-      if (params.region) {
-        const rid = parseInt(params.region);
-        if (idToStructure[rid]) {
-          filterDandisetPanelByRegion(rid, { pushState: false });
-        }
-      }
-      if (params.subject) {
-        selectSubjectByDir(did, params.subject, params.session || null);
-      }
+  const did = params.get('dandiset');
+  const region = params.get('region');
+  const subject = params.get('subject');
+  const session = params.get('session');
+
+  if (did && dandisetToStructures[did]) {
+    await enterDandisetView(did, { pushState: false });
+    if (region) {
+      const rid = parseInt(region);
+      if (idToStructure[rid]) filterDandisetPanelByRegion(rid, { pushState: false });
     }
-  } else if (params.region) {
-    const sid = parseInt(params.region);
-    if (idToStructure[sid]) {
-      selectRegion(sid, { expandTree: true, pushState: false });
+    if (subject) {
+      enterSubjectViewFromURL(did, subject, session || null);
     }
+  } else if (region) {
+    const sid = parseInt(region);
+    if (idToStructure[sid]) enterRegionView(sid, { expandTree: true, pushState: false });
   }
 }
 
-window.addEventListener('popstate', () => applyHashState());
+window.addEventListener('popstate', () => applyURLState());
 
 // ── Start ──────────────────────────────────────────────────────────────────
 init().catch(err => {
