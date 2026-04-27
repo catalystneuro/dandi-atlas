@@ -1773,9 +1773,16 @@ def _map_regions_by_abbreviation(brain_region_ids, abbrev_to_id, id_to_structure
     Accepts mixed input types (str, bytes, int) and a small set of sentinels
     (empty, None, "0", "outside" case-insensitive) which all map to OUTSIDE_ID.
     De-duplicates repeat labels within a single call.
+
+    Returns a tuple (regions, unmatched), where unmatched is a list of the raw
+    label values (strings) that didn't resolve to any structure in the atlas.
+    Mirrors the per-asset `unmatched_locations` capture that the Allen pipeline
+    does in process_asset_locations (scripts/update_data.py).
     """
     regions = []
     seen = set()
+    unmatched = []
+    unmatched_seen = set()
     for raw in brain_region_ids:
         if isinstance(raw, bytes):
             raw = raw.decode("utf-8", errors="replace")
@@ -1796,15 +1803,20 @@ def _map_regions_by_abbreviation(brain_region_ids, abbrev_to_id, id_to_structure
                 label_id = abbrev_to_id.get(str(int(key)))
             except (TypeError, ValueError):
                 pass
-        if label_id is not None and label_id in id_to_structure and label_id not in seen:
-            seen.add(label_id)
-            s = id_to_structure[label_id]
-            regions.append({
-                "id": label_id,
-                "acronym": s["acronym"],
-                "name": s["name"],
-            })
-    return regions
+        if label_id is not None and label_id in id_to_structure:
+            if label_id not in seen:
+                seen.add(label_id)
+                s = id_to_structure[label_id]
+                regions.append({
+                    "id": label_id,
+                    "acronym": s["acronym"],
+                    "name": s["name"],
+                })
+        else:
+            if key not in unmatched_seen:
+                unmatched_seen.add(key)
+                unmatched.append(key)
+    return regions, unmatched
 
 
 def fetch_dandi_data(
@@ -1897,14 +1909,17 @@ def fetch_dandi_data(
         # Map electrodes to regions via abbreviation lookup against the
         # structure graph. Rows with missing or unresolved brain_region_id
         # contribute nothing to the asset's region set (file-level
-        # aggregation: same forgiveness as Allen's location-string matching).
+        # aggregation: same forgiveness as Allen's location-string matching),
+        # but the unresolved labels are captured per asset for visibility,
+        # parallel to Allen's `unmatched_locations` field.
         brain_ids = result.get("brain_region_id") or []
         if brain_ids:
-            regions = _map_regions_by_abbreviation(
+            regions, unmatched_brain_region_ids = _map_regions_by_abbreviation(
                 brain_ids, abbrev_to_id, id_to_structure,
             )
         else:
             regions = []
+            unmatched_brain_region_ids = []
 
         session = extract_session(path)
 
@@ -1912,6 +1927,7 @@ def fetch_dandi_data(
             "path": path,
             "asset_id": asset_id,
             "regions": regions,
+            "unmatched_brain_region_ids": unmatched_brain_region_ids,
             "session": session,
         })
 
