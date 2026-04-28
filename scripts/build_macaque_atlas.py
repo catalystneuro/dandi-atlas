@@ -33,12 +33,15 @@ from macaque_atlas_lib import (
     ATLAS_CONFIGS,
     CATEGORY_ID_START,
     DANDISET_ID,
+    MACAQUE_LOCATION_ALIASES,
     OUTSIDE_ID,
     ROOT_ID,
     build_charm_structure_graph,
+    build_nmt_unified_structure_graph,
     build_structure_graph,
     ensure_d99_pial_cache,
     fetch_dandi_data,
+    fetch_macaque_implicit_data,
     generate_meshes,
     generate_meshes_from_gifti,
     get_ancestors,
@@ -46,7 +49,9 @@ from macaque_atlas_lib import (
     parse_charm_labels,
     parse_d99_labels,
     parse_mebrains_labels,
+    parse_sarm_labels,
 )
+from dandi_helpers import build_dandi_regions
 
 
 def main():
@@ -68,33 +73,52 @@ def main():
 
     # Parse labels
     print(f"Building {args.atlas} atlas data...")
+    charm_entries = None
+    sarm_entries = None
     if config["labels_type"] == "d99":
         entries = parse_d99_labels()
         print(f"  Parsed {len(entries)} D99 label entries")
     elif config["labels_type"] == "charm":
         entries = parse_charm_labels()
+        charm_entries = entries
         print(f"  Parsed {len(entries)} CHARM label entries")
+    elif config["labels_type"] == "nmt_unified":
+        charm_entries = parse_charm_labels()
+        sarm_entries = parse_sarm_labels()
+        entries = {"charm": charm_entries, "sarm": sarm_entries}
+        print(f"  Parsed {len(charm_entries)} CHARM + {len(sarm_entries)} SARM label entries")
     else:
         entries = parse_mebrains_labels()
         print(f"  Parsed {len(entries)} MEBRAINS label entries")
 
     if config["labels_type"] == "charm":
-        tree, id_to_structure, parent_map, abbrev_to_id = build_charm_structure_graph(
-            entries, root_name=config["root_name"],
+        tree, id_to_structure, parent_map, abbrev_to_id, name_to_id = (
+            build_charm_structure_graph(entries, root_name=config["root_name"])
+        )
+    elif config["labels_type"] == "nmt_unified":
+        tree, id_to_structure, parent_map, abbrev_to_id, name_to_id = (
+            build_nmt_unified_structure_graph(
+                charm_entries, sarm_entries,
+                root_name=config["root_name"],
+            )
         )
     elif config["labels_type"] == "mebrains":
         mebrains_colors = load_mebrains_palette_from_siibra()
-        tree, id_to_structure, parent_map, abbrev_to_id = build_structure_graph(
-            entries,
-            root_name=config["root_name"],
-            color_overrides=mebrains_colors,
-            labels_type="mebrains",
+        tree, id_to_structure, parent_map, abbrev_to_id, name_to_id = (
+            build_structure_graph(
+                entries,
+                root_name=config["root_name"],
+                color_overrides=mebrains_colors,
+                labels_type="mebrains",
+            )
         )
     else:
-        tree, id_to_structure, parent_map, abbrev_to_id = build_structure_graph(
-            entries,
-            root_name=config["root_name"],
-            labels_type=config["labels_type"],
+        tree, id_to_structure, parent_map, abbrev_to_id, name_to_id = (
+            build_structure_graph(
+                entries,
+                root_name=config["root_name"],
+                labels_type=config["labels_type"],
+            )
         )
 
     with open(data_dir / "structure_graph.json", "w") as f:
@@ -118,7 +142,8 @@ def main():
         no_mesh = generate_meshes_from_gifti(
             args.atlas, config["nifti"], meshes_dir, id_to_structure,
             config["gifti_surfaces"],
-            charm_entries=entries if config["labels_type"] == "charm" else None,
+            charm_entries=charm_entries,
+            sarm_entries=sarm_entries,
             template_nifti=config.get("template_nifti"),
         )
     else:
@@ -182,6 +207,23 @@ def main():
     else:
         dandiset_assets, dandisets_with_electrodes, dandi_regions = fetch_dandi_data(
             config, abbrev_to_id, id_to_structure, parent_map,
+            name_to_id=name_to_id,
+        )
+        # Implicit-routing pass: discover all other public macaque dandisets
+        # and add region-tag-only records for any whose free-text location
+        # strings resolve in this atlas. Embargoed dandisets are skipped (they
+        # don't appear in the public listing); inject those manually via the
+        # one-off scripts in ongoing_issues/ and let CI overwrite them later.
+        implicit_addition = fetch_macaque_implicit_data(
+            abbrev_to_id, id_to_structure, name_to_id,
+            aliases=MACAQUE_LOCATION_ALIASES,
+        )
+        for ds_id, recs in implicit_addition.items():
+            dandiset_assets[ds_id] = recs
+        # Rebuild dandi_regions over the merged dandiset_assets so counts and
+        # ancestor propagation account for the implicit additions.
+        dandi_regions = build_dandi_regions(
+            dandiset_assets, id_to_structure, parent_map,
         )
 
     with open(data_dir / "dandiset_assets.json", "w") as f:

@@ -40,7 +40,7 @@ def parse_region_ids(arg):
 
 
 def build_regions(atlas, force=False, region_ids=None):
-    config, _tree, id_to_structure, _pmap, _amap, entries = build_atlas_graph(atlas)
+    config, _tree, id_to_structure, _pmap, _amap, _nmap, entries = build_atlas_graph(atlas)
     meshes_dir = config["output_dir"] / "meshes"
     meshes_dir.mkdir(parents=True, exist_ok=True)
 

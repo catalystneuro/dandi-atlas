@@ -56,6 +56,7 @@ D99_LABELS_FILE = TURNER_DATA / "d99_atlas/D99_v2.0_dist/D99_v2.0_labels_semicol
 NMT_LABELS_FILE = TURNER_DATA / "nmt_v2/NMT_v2.0_sym/tables_D99/D99_labeltable.txt"
 CHARM_LABELS_FILE = TURNER_DATA / "nmt_v2/NMT_v2.0_sym/tables_CHARM/CHARM_key_all.txt"
 CHARM_PALETTE_FILE = TURNER_DATA / "nmt_v2/NMT_v2.0_sym/tables_CHARM/hue_CHARM_cmap.pal"
+SARM_LABELS_FILE = TURNER_DATA / "nmt_v2/NMT_v2.0_sym/tables_SARM/SARM_key_all.txt"
 MEBRAINS_LABELS_FILE = TURNER_DATA / "mebrains/MEBRAINS_labels.json"
 
 # Siibra (Scalable Infrastructure for Integration of Brain Atlas Research
@@ -73,6 +74,14 @@ SIIBRA_MEBRAINS_LABELLED_MAP_URL = (
     "master/maps/monkey-mebrains-labelled.json"
 )
 SIIBRA_MEBRAINS_PALETTE_CACHE = SCRIPTS_DIR / "siibra_mebrains_palette.json"
+
+# Atlas-independent cache of free-text location strings extracted from each
+# macaque NWB asset (electrodes/location, optophysiology/<plane>/location,
+# intracellular_ephys/<electrode>/location, deduplicated). Shared across all
+# three macaque atlas builds to avoid re-streaming the same NWB three times
+# during the implicit-routing pass. JSONL: each line is
+# {"asset_id": "...", "dandiset_id": "...", "locations": [...]}.
+MACAQUE_LOCATIONS_CACHE = SCRIPTS_DIR / "macaque_locations_cache.jsonl"
 
 # D99 whole-brain cortical surfaces from HumanBrainED/RheMAP-Surf. AFNI's D99
 # v2 distribution does NOT ship whole-brain surfaces (only per-ROI meshes
@@ -117,16 +126,22 @@ ATLAS_CONFIGS = {
     },
     "nmt": {
         "nifti": TURNER_DATA / "nmt_v2/NMT_v2.0_sym/NMT_v2.0_sym/supplemental_CHARM/CHARM_4_in_NMT_v2.0_sym.nii.gz",
-        "labels_type": "charm",
+        # "nmt_unified" combines CHARM cortex + SARM subcortex under one
+        # structure graph and one mesh directory. Both label tables share the
+        # NMT v2 sym RAS frame, so per-region GIFTIs from each atlas line up
+        # under the same root mesh.
+        "labels_type": "nmt_unified",
         "hdf5_path": "general/localization/NMTv2AtlasCoordinates",
         "output_dir": PROJECT_ROOT / "data/atlases/nmt",
         "cache_file": SCRIPTS_DIR / "nmt_electrode_cache.jsonl",
-        "root_name": "NMT v2.0 sym (CHARM)",
-        # CHARM ships per-region surfaces per hierarchy level. Each per-region
-        # surface is already bilateral (symmetric about X=0), so no mirroring
-        # is needed. Whole-brain root uses lh+rh gray-surface union.
+        "root_name": "NMT v2.0 sym",
+        # CHARM and SARM each ship per-region surfaces per hierarchy level.
+        # SARM surfaces are looked up by the *native* SARM index, not the
+        # offset id used inside the unified structure graph (see
+        # _find_sarm_surface). Whole-brain root uses lh+rh gray-surface union.
         "gifti_surfaces": {
             "charm_levels_dir": TURNER_DATA / "nmt_v2/NMT_v2.0_sym/NMT_v2.0_sym_surfaces/atlases/CHARM",
+            "sarm_levels_dir": TURNER_DATA / "nmt_v2/NMT_v2.0_sym/NMT_v2.0_sym_surfaces/atlases/SARM",
             "whole_brain_lh": TURNER_DATA / "nmt_v2/NMT_v2.0_sym/NMT_v2.0_sym_surfaces/lh.gray_surface.rsl.gii",
             "whole_brain_rh": TURNER_DATA / "nmt_v2/NMT_v2.0_sym/NMT_v2.0_sym_surfaces/rh.gray_surface.rsl.gii",
             "filename_pattern": re.compile(r"\.k(\d+)\.gii$"),
@@ -157,6 +172,81 @@ ROOT_ID = 9999
 OUTSIDE_ID = 9998
 CATEGORY_ID_START = 10001
 SUBCATEGORY_ID_START = 10100
+
+# Alias map for free-text electrode/imaging-plane/icephys location strings seen
+# across macaque dandisets that don't ship the AnatomicalCoordinatesTable
+# extension. Keys are normalized lowercased labels (treat `_` and ` ` as
+# equivalent; the resolver normalizes via _normalize_region_name). Values are
+# one of:
+#   - list[str]: one or more canonical full names or abbreviations to attempt
+#     in each atlas's vocabulary. The first that resolves wins per atlas;
+#     all that resolve are added (deduped).
+#   - empty list: explicit "I declined to alias this" — falls through to
+#     unmatched without a substring match.
+#   - None: explicit no-match sentinel — must NOT substring-match anything
+#     (used to block false positives like `"soma"` -> `"somatosensory"`).
+#
+# Policy: when an upstream label is ambiguous between sibling regions
+# (e.g. "V1/V2"), prefer the lowest common ancestor (the lobe) over crediting
+# both children. "If in doubt, go higher." This avoids inflating per-region
+# counts with electrodes the upstream author themselves could not localize
+# precisely. Documented in the alias commentary in
+# obsidian_docs/3d_visualization/neurological_vs_radiological_convention.md
+# (orientation principle) and macaque_color_policy.md (per-atlas coverage).
+MACAQUE_LOCATION_ALIASES = {
+    # Motor cortex
+    "m1": ["primary motor cortex"],
+    "m1 motor cortex": ["primary motor cortex"],
+    "primary motor cortex": ["primary motor cortex"],
+    "hand area of m1": ["primary motor cortex"],
+    "m1-s": ["primary motor cortex"],
+    "m1-g": ["primary motor cortex"],
+    "pmd": ["dorsal premotor cortex", "PMd"],
+    "pre-motor cortex, dorsal": ["dorsal premotor cortex", "PMd"],
+    "pmv": ["ventral premotor cortex", "PMv"],
+    "sma": ["supplementary motor area"],
+    # Visual cortex
+    "v1": ["primary visual cortex", "V1"],
+    "v2": ["secondary visual cortex", "V2"],
+    "v4": ["V4", "area V4"],
+    # "V1/V2" is the slash-joined ambiguous case: per the policy above, we
+    # roll up to the lobe rather than crediting both V1 and V2 individually.
+    "v1/v2": ["occipital lobe", "Occipital Lobe"],
+    # Somatosensory
+    "s1": ["primary somatosensory cortex", "S1"],
+    "s1 area 2": ["area 2"],
+    # Hippocampus
+    "ca1": ["CA1", "field CA1", "hippocampal field CA1"],
+    # Substantia nigra: D99 has the full nigral subdivision (SNpc, SNpr, SNpl,
+    # SNpm); SARM only has a lumped "substantia nigra". Map the pars labels to
+    # SN as a specificity-loss fallback so icephys data localized to a pars
+    # surfaces in the NMT tab too. D99's full-name resolver wins via
+    # name_exact before the alias map runs, so this only kicks in for NMT.
+    "substantia nigra pars compacta": ["substantia nigra"],
+    "substantia nigra pars reticulata": ["substantia nigra"],
+    "substantia nigra pars lateralis": ["substantia nigra"],
+    "substantia nigra pars mixta": ["substantia nigra"],
+    # Prefrontal
+    "pfc": ["prefrontal cortex"],
+    "dmfc": [],  # too vague to alias confidently
+    # Sentinels and non-anatomical (skip, do not record as unmatched)
+    "soma": None,
+    "unknown": None,
+    "n/a": None,
+    "alm": None,  # mouse-specific; not present in macaque atlases
+}
+# SARM IDs are offset by SARM_OFFSET when merged with CHARM in the unified NMT
+# structure graph so they cannot collide with CHARM IDs (which top out at 246)
+# or with the synthetic category IDs above. SARM native IDs run 1-318, so the
+# offset places them at 20001-20318. Keep this in sync with parse_sarm_labels
+# and any per-region GIFTI lookups (which need to subtract the offset to find
+# the upstream surface file by its native SARM index).
+SARM_OFFSET = 20000
+# Synthetic container nodes that group the CHARM and SARM subtrees under the
+# unified NMT root. These IDs are unique to the unified-NMT structure graph and
+# do not appear in any upstream label table.
+NMT_UNIFIED_CORTEX_ID = 10001
+NMT_UNIFIED_SUBCORTEX_ID = 10002
 TARGET_FACES = 10_000
 # Root (whole-brain outline) gets a higher face cap so surface detail shows.
 # Region meshes stay at TARGET_FACES since they're smaller and overlap with each other.
@@ -218,6 +308,31 @@ D99_CATEGORY_RANGES = {
     "Bed nucleus of stria terminalis":  (340, 15),   # pink
     "Other":                            (100, 30),   # yellow-green fallback
 }
+
+
+# ---------------------------------------------------------------------------
+# Region-key normalization (shared by macaque builders and resolvers)
+# ---------------------------------------------------------------------------
+
+
+def _normalize_region_name(value):
+    """Canonicalize a brain-region full name for case- and whitespace-insensitive
+    lookup. Lowercases, strips, and treats underscores and spaces as equivalent
+    so that the upstream label tables (which use `_`) and the structure-graph
+    nodes (which use ` `) and any NWB writer that uses either convention all
+    collapse to the same key. Bytes are decoded as UTF-8.
+
+    Returns None for empty / None / non-string-coercible inputs so callers can
+    cleanly skip them without raising.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", errors="replace")
+    s = str(value).strip().lower()
+    if not s:
+        return None
+    return s.replace("_", " ")
 
 
 # ---------------------------------------------------------------------------
@@ -423,6 +538,71 @@ def parse_charm_labels():
     return entries
 
 
+def parse_sarm_labels(offset=SARM_OFFSET):
+    """Parse SARM_key_all.txt and return entries with hierarchy.
+
+    SARM (Subcortical Atlas of the Rhesus Macaque, Hartig and Evrard 2021) is
+    the subcortex companion to CHARM in the AFNI NMT v2 distribution. Its key
+    table uses the same five-column schema as CHARM
+    (Index | Abbreviation | Full_Name | First_Level | Last_Level), so the
+    parsing logic mirrors parse_charm_labels.
+
+    Parameters
+    ----------
+    offset : int
+        Constant added to every native SARM index so the resulting IDs cannot
+        collide with CHARM IDs (1-246) or any synthetic IDs in the macaque
+        pipeline. The native SARM ID is preserved under the `native_index` key
+        so per-region GIFTI lookups can recover the upstream surface filename.
+
+    Returns
+    -------
+    list of dict
+        Each entry has keys: index (offset-applied), native_index, abbreviation,
+        name, level, parent_index (offset-applied, or None for level 1).
+    """
+    entries = []
+    ancestors = {}
+
+    with open(SARM_LABELS_FILE) as f:
+        next(f)  # skip header
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split("\t")
+            native_index = int(parts[0])
+            index = native_index + offset
+            abbreviation = parts[1]
+            full_name = parts[2].replace("_", " ")
+            first_level = int(parts[3])
+
+            if first_level == 1:
+                parent_index = None
+            else:
+                parent_index = None
+                for ancestor_level in range(first_level - 1, 0, -1):
+                    if ancestor_level in ancestors:
+                        parent_index = ancestors[ancestor_level]
+                        break
+
+            ancestors[first_level] = index
+            for ancestor_level in list(ancestors):
+                if ancestor_level > first_level:
+                    del ancestors[ancestor_level]
+
+            entries.append({
+                "index": index,
+                "native_index": native_index,
+                "abbreviation": abbreviation,
+                "name": full_name,
+                "level": first_level,
+                "parent_index": parent_index,
+            })
+
+    return entries
+
+
 def load_charm_palette():
     """Load the official CHARM colour palette shipped with NMT v2.0-sym.
 
@@ -563,11 +743,15 @@ def build_charm_structure_graph(entries, root_name="NMT v2.0 sym (CHARM)"):
     Unlike build_structure_graph (which uses category/subcategory), this
     uses CHARM's own parent-child relationships from the level hierarchy.
 
-    Returns (tree_root, id_to_structure, parent_map, abbrev_to_id).
+    Returns (tree_root, id_to_structure, parent_map, abbrev_to_id, name_to_id).
+    name_to_id is keyed by `_normalize_region_name(full_name)` so resolvers can
+    look up regions by full name without worrying about case, whitespace, or
+    underscore/space convention drift between the label table and any NWB file.
     """
     id_to_structure = {}
     parent_map = {}
     abbrev_to_id = {}
+    name_to_id = {}
 
     # Official CHARM colour palette, keyed by label index. Shipped with the
     # NMT v2.0-sym distribution as tables_CHARM/hue_CHARM_cmap.pal.
@@ -616,6 +800,9 @@ def build_charm_structure_graph(entries, root_name="NMT v2.0 sym (CHARM)"):
         id_to_structure[label_id] = node
         parent_map[label_id] = parent_id
         abbrev_to_id[entry["abbreviation"]] = label_id
+        norm_name = _normalize_region_name(entry["name"])
+        if norm_name is not None and norm_name not in name_to_id:
+            name_to_id[norm_name] = label_id
 
     # Build tree by nesting children
     for node_id, node in id_to_structure.items():
@@ -623,7 +810,161 @@ def build_charm_structure_graph(entries, root_name="NMT v2.0 sym (CHARM)"):
         if pid is not None and pid in id_to_structure:
             id_to_structure[pid]["children"].append(node)
 
-    return [root], id_to_structure, parent_map, abbrev_to_id
+    return [root], id_to_structure, parent_map, abbrev_to_id, name_to_id
+
+
+def build_nmt_unified_structure_graph(
+    charm_entries, sarm_entries,
+    root_name="NMT v2.0 sym (CHARM + SARM)",
+):
+    """Build a unified NMT structure graph with CHARM cortex and SARM subcortex.
+
+    Wraps the existing CHARM hierarchy (4 lobes, 6 levels) and the SARM
+    hierarchy (5 embryological systems, 6 levels) under two synthetic container
+    nodes so the side panel surfaces a coherent cortex / subcortex split.
+    SARM entry IDs are assumed to already be offset (see parse_sarm_labels);
+    no further offsetting happens here.
+
+    Returns (tree_root, id_to_structure, parent_map, abbrev_to_id, name_to_id).
+    Both lookup tables are populated for both atlases. abbrev_to_id has 5 known
+    cortex-vs-subcortex collisions where CHARM wins (e.g. "R" = CHARM rostral
+    core region vs SARM red nucleus). The full-name lookup table name_to_id is
+    collision-free across CHARM and SARM, so the resolver should prefer the
+    full name (`brain_region`) over the abbreviation (`brain_region_id`)
+    whenever the NWB file provides both.
+    """
+    id_to_structure = {}
+    parent_map = {}
+    abbrev_to_id = {}
+    name_to_id = {}
+
+    charm_palette = load_charm_palette()
+
+    root = {
+        "id": ROOT_ID,
+        "acronym": "root",
+        "name": root_name,
+        "color_hex_triplet": "FFFFFF",
+        "parent_structure_id": None,
+        "children": [],
+    }
+    id_to_structure[ROOT_ID] = root
+    parent_map[ROOT_ID] = None
+
+    outside_node = {
+        "id": OUTSIDE_ID,
+        "acronym": "outside",
+        "name": "Outside atlas",
+        "color_hex_triplet": "888888",
+        "parent_structure_id": ROOT_ID,
+        "children": [],
+    }
+    id_to_structure[OUTSIDE_ID] = outside_node
+    parent_map[OUTSIDE_ID] = ROOT_ID
+
+    cortex_container = {
+        "id": NMT_UNIFIED_CORTEX_ID,
+        "acronym": "Cortex",
+        "name": "Cortex (CHARM)",
+        "color_hex_triplet": "B0B0B0",
+        "parent_structure_id": ROOT_ID,
+        "children": [],
+    }
+    id_to_structure[NMT_UNIFIED_CORTEX_ID] = cortex_container
+    parent_map[NMT_UNIFIED_CORTEX_ID] = ROOT_ID
+
+    subcortex_container = {
+        "id": NMT_UNIFIED_SUBCORTEX_ID,
+        "acronym": "Subcortex",
+        "name": "Subcortex (SARM)",
+        "color_hex_triplet": "808080",
+        "parent_structure_id": ROOT_ID,
+        "children": [],
+    }
+    id_to_structure[NMT_UNIFIED_SUBCORTEX_ID] = subcortex_container
+    parent_map[NMT_UNIFIED_SUBCORTEX_ID] = ROOT_ID
+
+    # CHARM subtree. Top-level CHARM entries (level 1 lobes) re-parent to the
+    # synthetic Cortex container instead of the root.
+    for entry in charm_entries:
+        label_id = entry["index"]
+        parent_index = entry["parent_index"]
+        if parent_index is None:
+            parent_id = NMT_UNIFIED_CORTEX_ID
+        else:
+            parent_id = parent_index
+
+        color = charm_palette.get(label_id, "AAAAAA")
+        node = {
+            "id": label_id,
+            "acronym": entry["abbreviation"],
+            "name": entry["name"],
+            "color_hex_triplet": color,
+            "parent_structure_id": parent_id,
+            "children": [],
+            "source": "charm",
+        }
+        id_to_structure[label_id] = node
+        parent_map[label_id] = parent_id
+        abbrev_to_id[entry["abbreviation"]] = label_id
+        norm_name = _normalize_region_name(entry["name"])
+        if norm_name is not None and norm_name not in name_to_id:
+            name_to_id[norm_name] = label_id
+
+    # SARM subtree. SARM has no shipped colour palette analogous to CHARM's
+    # hue_CHARM_cmap.pal; a placeholder grey is used here. A follow-up will
+    # wire SARM categories into D99_CATEGORY_RANGES (Plan B step 5).
+    sarm_abbrev_collisions = []
+    sarm_name_collisions = []
+    for entry in sarm_entries:
+        label_id = entry["index"]
+        parent_index = entry["parent_index"]
+        if parent_index is None:
+            parent_id = NMT_UNIFIED_SUBCORTEX_ID
+        else:
+            parent_id = parent_index
+
+        node = {
+            "id": label_id,
+            "acronym": entry["abbreviation"],
+            "name": entry["name"],
+            "color_hex_triplet": "808080",
+            "parent_structure_id": parent_id,
+            "children": [],
+            "source": "sarm",
+            "native_index": entry["native_index"],
+        }
+        id_to_structure[label_id] = node
+        parent_map[label_id] = parent_id
+        if entry["abbreviation"] in abbrev_to_id:
+            sarm_abbrev_collisions.append(entry["abbreviation"])
+        else:
+            abbrev_to_id[entry["abbreviation"]] = label_id
+        norm_name = _normalize_region_name(entry["name"])
+        if norm_name is not None:
+            if norm_name in name_to_id:
+                sarm_name_collisions.append(entry["name"])
+            else:
+                name_to_id[norm_name] = label_id
+
+    for node_id, node in id_to_structure.items():
+        pid = node.get("parent_structure_id")
+        if pid is not None and pid in id_to_structure:
+            id_to_structure[pid]["children"].append(node)
+
+    if sarm_abbrev_collisions:
+        print(
+            f"  [unified NMT] {len(sarm_abbrev_collisions)} SARM abbreviations "
+            f"collide with CHARM (resolver will prefer full name; abbreviation "
+            f"fallback resolves to CHARM): {sarm_abbrev_collisions}"
+        )
+    if sarm_name_collisions:
+        print(
+            f"  [unified NMT] {len(sarm_name_collisions)} SARM full names "
+            f"collide with CHARM (UNEXPECTED, investigate): {sarm_name_collisions}"
+        )
+
+    return [root], id_to_structure, parent_map, abbrev_to_id, name_to_id
 
 
 # ---------------------------------------------------------------------------
@@ -764,7 +1105,11 @@ def build_structure_graph(entries, root_name="D99 Atlas", color_overrides=None, 
     back to the legacy per-index-within-category HSL formula keyed off
     CATEGORY_HUES.
 
-    Returns (tree_root, id_to_structure, parent_map, abbrev_to_id).
+    Returns (tree_root, id_to_structure, parent_map, abbrev_to_id, name_to_id).
+    name_to_id keys are full names normalized via _normalize_region_name (case-
+    and underscore-insensitive). The macaque resolver prefers full-name lookup
+    over abbreviation lookup so collisions in abbreviation space (e.g. CHARM
+    vs SARM "R") are bypassed when an NWB file ships the full region name.
     """
     # Assign colors by category with brightness variation
     category_counts = {}
@@ -870,6 +1215,7 @@ def build_structure_graph(entries, root_name="D99 Atlas", color_overrides=None, 
         parent_map[subcat_id] = cat_id
 
     abbrev_to_id = {}
+    name_to_id = {}
     for entry in entries:
         label_id = entry["index"]
         cat = entry["category"]
@@ -894,6 +1240,9 @@ def build_structure_graph(entries, root_name="D99 Atlas", color_overrides=None, 
         id_to_structure[label_id] = node
         parent_map[label_id] = parent_id
         abbrev_to_id[entry["abbreviation"]] = label_id
+        norm_name = _normalize_region_name(entry["name"])
+        if norm_name is not None and norm_name not in name_to_id:
+            name_to_id[norm_name] = label_id
         # For NMT entries, also add the D99 abbreviation as an alias so that
         # brain_region_id values from NWB files (which use D99 abbreviations)
         # resolve to the correct NMT structure IDs.
@@ -912,7 +1261,7 @@ def build_structure_graph(entries, root_name="D99 Atlas", color_overrides=None, 
         if pid is not None and pid in id_to_structure:
             id_to_structure[pid]["children"].append(node)
 
-    return [root], id_to_structure, parent_map, abbrev_to_id
+    return [root], id_to_structure, parent_map, abbrev_to_id, name_to_id
 
 
 # ---------------------------------------------------------------------------
@@ -1306,6 +1655,28 @@ def _find_charm_surface(charm_levels_dir, level, label_id, pattern):
     return None
 
 
+def _find_sarm_surface(sarm_levels_dir, level, native_label_id, pattern):
+    """Find the surface file for a SARM label at a specific level.
+
+    SARM ships per-region surfaces under
+    `NMT_v2.0_sym_surfaces/atlases/SARM/Level_<N>/SARM_<N>.<acronym>.k<id>.gii`,
+    using its native (non-offset) integer label IDs. The unified NMT structure
+    graph stores SARM IDs offset by SARM_OFFSET to avoid colliding with CHARM
+    IDs, so callers must subtract the offset before invoking this lookup. The
+    `native_label_id` argument expects the already-de-offset value.
+    """
+    level_dir = Path(sarm_levels_dir) / f"Level_{level}"
+    if not level_dir.exists():
+        return None
+    for entry in level_dir.iterdir():
+        if not entry.name.endswith(".gii"):
+            continue
+        m = pattern.search(entry.name)
+        if m and int(m.group(1)) == native_label_id:
+            return entry
+    return None
+
+
 def _find_d99_surface(surfaces_dir, label_id, pattern):
     """Find the D99 surface file for a label ID."""
     surfaces_dir = Path(surfaces_dir)
@@ -1405,7 +1776,7 @@ def _export_merged_gifti_glb(
 
 def generate_meshes_from_gifti(
     atlas, nifti_file, meshes_dir, id_to_structure, gifti_config, charm_entries=None,
-    template_nifti=None,
+    sarm_entries=None, template_nifti=None,
 ):
     """Generate GLB meshes from upstream GIFTI surfaces.
 
@@ -1546,8 +1917,8 @@ def generate_meshes_from_gifti(
     elif atlas == "nmt":
         if charm_entries is None:
             raise ValueError("charm_entries required for NMT GIFTI mesh generation")
-        # Each CHARM entry carries its own native hierarchy level. Surfaces at
-        # level N live under `atlases/CHARM/Level_N/`.
+        # CHARM entries: surfaces under atlases/CHARM/Level_N/, looked up by
+        # the entry's native CHARM index (== its structure-graph id).
         charm_levels_dir = gifti_config["charm_levels_dir"]
         for entry in sorted(charm_entries, key=lambda e: e["index"]):
             label_id = entry["index"]
@@ -1570,11 +1941,47 @@ def generate_meshes_from_gifti(
                 )
                 generated += 1
                 if generated % 50 == 0:
-                    print(f"  Generated {generated} meshes...")
+                    print(f"  Generated {generated} CHARM/SARM meshes...")
             except Exception as exc:
                 print(f"  Failed mesh for label {label_id}: {exc}")
                 failed += 1
                 no_mesh.append(label_id)
+
+        # SARM entries: surfaces under atlases/SARM/Level_N/, looked up by the
+        # *native* SARM index (entry["native_index"]) since SARM file names
+        # carry the upstream IDs and the unified structure graph offsets them
+        # by SARM_OFFSET to avoid CHARM collisions. The GLB filename uses the
+        # offset id (entry["index"]) so the viewer's mesh manifest can address
+        # SARM and CHARM regions disjointly.
+        sarm_levels_dir = gifti_config.get("sarm_levels_dir")
+        if sarm_levels_dir is not None and sarm_entries is not None:
+            for entry in sorted(sarm_entries, key=lambda e: e["index"]):
+                label_id = entry["index"]
+                native_id = entry["native_index"]
+                level = entry["level"]
+                glb_path = meshes_dir / f"{label_id}.glb"
+                if glb_path.exists():
+                    skipped_existing += 1
+                    continue
+                source = _find_sarm_surface(
+                    sarm_levels_dir, level, native_id, pattern,
+                )
+                if source is None:
+                    no_mesh.append(label_id)
+                    continue
+                try:
+                    verts, faces = load_gifti_mesh(source)
+                    _export_gifti_glb(
+                        glb_path, verts, faces, mirror=mirror,
+                        target_faces=TARGET_FACES_GIFTI,
+                    )
+                    generated += 1
+                    if generated % 50 == 0:
+                        print(f"  Generated {generated} CHARM/SARM meshes...")
+                except Exception as exc:
+                    print(f"  Failed mesh for SARM label {label_id} (native {native_id}): {exc}")
+                    failed += 1
+                    no_mesh.append(label_id)
 
     # --- Synthetic parent meshes --------------------------------------------
     # Nodes that aren't backed by a surface file need their mesh merged from
@@ -1662,6 +2069,58 @@ def _read_hdf5_strings(group, key):
     if isinstance(raw, bytes):
         return [raw.decode("utf-8")]
     return [str(raw)]
+
+
+def extract_macaque_location_strings(url):
+    """Read free-text location strings from the three standard NWB places used
+    by macaque dandisets that do NOT ship the AnatomicalCoordinatesTable
+    extension. Returns a deduplicated list of distinct, non-empty strings.
+
+    Sources read (mirrors scripts/dandi_helpers.py:extract_locations):
+      - general/extracellular_ephys/electrodes/location
+      - general/optophysiology/<plane>/location
+      - general/intracellular_ephys/<electrode>/location
+
+    Atlas-independent; the same set of strings is then resolved separately
+    against each macaque atlas's vocabulary (D99, NMT-with-SARM, MEBRAINS).
+    """
+    import h5py
+    import remfile
+
+    seen = set()
+    out = []
+
+    def _push(value):
+        if isinstance(value, bytes):
+            value = value.decode("utf-8", errors="replace")
+        s = str(value).strip()
+        if not s or s in seen:
+            return
+        seen.add(s)
+        out.append(s)
+
+    rf = remfile.File(url)
+    with h5py.File(rf, "r") as f:
+        if "general/extracellular_ephys/electrodes" in f:
+            elec = f["general/extracellular_ephys/electrodes"]
+            if "location" in elec:
+                raw = elec["location"][()]
+                if hasattr(raw, "__iter__") and not isinstance(raw, (str, bytes)):
+                    for v in raw:
+                        _push(v)
+                else:
+                    _push(raw)
+        if "general/optophysiology" in f:
+            for name in f["general/optophysiology"]:
+                plane = f[f"general/optophysiology/{name}"]
+                if isinstance(plane, h5py.Group) and "location" in plane:
+                    _push(plane["location"][()])
+        if "general/intracellular_ephys" in f:
+            for name in f["general/intracellular_ephys"]:
+                item = f[f"general/intracellular_ephys/{name}"]
+                if isinstance(item, h5py.Group) and "location" in item:
+                    _push(item["location"][()])
+    return out
 
 
 def extract_atlas_coords(url, asset_id, hdf5_path):
@@ -1814,16 +2273,145 @@ def _map_regions_by_abbreviation(brain_region_ids, abbrev_to_id, id_to_structure
     return regions, unmatched
 
 
+def _map_regions_for_macaque(
+    brain_regions, brain_region_ids, name_to_id, abbrev_to_id, id_to_structure,
+    aliases=None,
+):
+    """Resolve macaque electrode regions across three matching passes.
+
+    Resolution order per row (first hit wins, except aliases which can
+    contribute multiple region IDs):
+      1. Full-name exact match (`brain_region`, normalized via
+         _normalize_region_name) against name_to_id.
+      2. Abbreviation exact match (`brain_region_id`) against abbrev_to_id.
+      3. Alias map: if `aliases` is provided and the normalized name is a key,
+         try each target string as a name match then as an abbrev match.
+         Multi-target aliases that resolve in multiple places contribute all
+         matches (deduped). An alias mapped to None is an explicit no-match
+         sentinel and skips the row entirely (no unmatched record).
+
+    NWB files in DANDI 001636 use the AnatomicalCoordinatesTable extension and
+    ship `brain_region` (full name, e.g. "red nucleus") + `brain_region_id`
+    (abbreviation, e.g. "R"). The full name is collision-free across CHARM
+    and SARM, while the abbreviation has 5 cortex-vs-subcortex clashes. NWBs
+    without the extension ship only free-text strings on `electrodes/location`,
+    `optophysiology/<plane>/location`, or `intracellular_ephys/<elec>/location`;
+    those go through the implicit-routing path (resolve once per atlas, add
+    to whichever matched).
+
+    Both inputs are aligned per-electrode; either may be shorter (or empty),
+    in which case missing entries are None for that row. Sentinels (empty,
+    "0", "outside" case-insensitive) on either side map to OUTSIDE_ID.
+    De-duplication and the unmatched-list contract match
+    _map_regions_by_abbreviation.
+    """
+    regions = []
+    seen = set()
+    unmatched = []
+    unmatched_seen = set()
+
+    n = max(len(brain_regions), len(brain_region_ids))
+    for i in range(n):
+        name_raw = brain_regions[i] if i < len(brain_regions) else None
+        abbrev_raw = brain_region_ids[i] if i < len(brain_region_ids) else None
+
+        if isinstance(name_raw, bytes):
+            name_raw = name_raw.decode("utf-8", errors="replace")
+        if isinstance(abbrev_raw, bytes):
+            abbrev_raw = abbrev_raw.decode("utf-8", errors="replace")
+
+        name_str = None if name_raw is None else str(name_raw).strip()
+        abbrev_str = None if abbrev_raw is None else str(abbrev_raw).strip()
+
+        is_outside_name = name_str is not None and (
+            name_str == "" or name_str == "0" or name_str.lower() == "outside"
+        )
+        is_outside_abbrev = abbrev_str is not None and (
+            abbrev_str == "" or abbrev_str == "0" or abbrev_str.lower() == "outside"
+        )
+        if (name_str is None or is_outside_name) and (
+            abbrev_str is None or is_outside_abbrev
+        ):
+            if OUTSIDE_ID in seen:
+                continue
+            seen.add(OUTSIDE_ID)
+            regions.append({
+                "id": OUTSIDE_ID,
+                "acronym": "outside",
+                "name": "Outside atlas",
+            })
+            continue
+
+        label_ids = []
+        norm_name = _normalize_region_name(name_str)
+        if norm_name is not None and norm_name in name_to_id:
+            label_ids.append(name_to_id[norm_name])
+        if not label_ids and abbrev_str:
+            lid = abbrev_to_id.get(abbrev_str)
+            if lid is None:
+                try:
+                    lid = abbrev_to_id.get(str(int(abbrev_str)))
+                except (TypeError, ValueError):
+                    pass
+            if lid is not None:
+                label_ids.append(lid)
+        # Alias-map fallback. Try the normalized full name first; if that's
+        # not in the map, try the normalized abbreviation. The first key that
+        # exists in the alias map governs. None-valued entries are sentinels
+        # that intentionally suppress the unmatched record.
+        alias_key = None
+        suppressed = False
+        if not label_ids and aliases is not None:
+            for cand in (norm_name, _normalize_region_name(abbrev_str)):
+                if cand is not None and cand in aliases:
+                    alias_key = cand
+                    break
+            if alias_key is not None:
+                targets = aliases[alias_key]
+                if targets is None:
+                    suppressed = True
+                elif targets:
+                    for tgt in targets:
+                        tgt_norm = _normalize_region_name(tgt)
+                        if tgt_norm and tgt_norm in name_to_id:
+                            label_ids.append(name_to_id[tgt_norm])
+                        elif tgt in abbrev_to_id:
+                            label_ids.append(abbrev_to_id[tgt])
+
+        if label_ids:
+            for label_id in label_ids:
+                if label_id in seen or label_id not in id_to_structure:
+                    continue
+                seen.add(label_id)
+                s = id_to_structure[label_id]
+                regions.append({
+                    "id": label_id,
+                    "acronym": s["acronym"],
+                    "name": s["name"],
+                })
+        elif not suppressed:
+            unmatched_key = name_str or abbrev_str or ""
+            if unmatched_key and unmatched_key not in unmatched_seen:
+                unmatched_seen.add(unmatched_key)
+                unmatched.append(unmatched_key)
+    return regions, unmatched
+
+
 def fetch_dandi_data(
-    config, abbrev_to_id, id_to_structure, parent_map,
+    config, abbrev_to_id, id_to_structure, parent_map, name_to_id=None,
 ):
     """Fetch electrode data from DANDI 001636 and build all output files.
 
-    Region mapping is abbreviation-primary: each electrode's brain_region_id
-    is dict-looked-up in the structure graph. Rows with missing or unresolved
-    brain_region_id contribute coordinates only — they don't add any region
-    to the asset's region attribution. This matches the file-level aggregation
-    model used by the Allen CCF pipeline (see scripts/update_data.py).
+    Region mapping is full-name-primary when `name_to_id` is supplied (macaque
+    atlases): each electrode's `brain_region` (full name) is matched against the
+    structure graph first, and only when that fails does the resolver fall back
+    to the abbreviation in `brain_region_id`. This avoids the 5 known
+    cortex-vs-subcortex abbreviation collisions in the unified NMT graph
+    (e.g. "R" = CHARM rostral core region vs SARM red nucleus).
+
+    Rows whose name and abbreviation both fail to resolve contribute coordinates
+    only and add nothing to the asset's region attribution. This matches the
+    file-level aggregation model used by the Allen CCF pipeline.
     """
     hdf5_path = config["hdf5_path"]
     cache_file = config["cache_file"]
@@ -1901,17 +2489,23 @@ def fetch_dandi_data(
             skipped_no_loc += 1
             continue
 
-        # Map electrodes to regions via abbreviation lookup against the
-        # structure graph. Rows with missing or unresolved brain_region_id
-        # contribute nothing to the asset's region set (file-level
-        # aggregation: same forgiveness as Allen's location-string matching),
-        # but the unresolved labels are captured per asset for visibility,
-        # parallel to Allen's `unmatched_locations` field.
+        # Map electrodes to regions against the structure graph. Rows with no
+        # resolvable label contribute nothing to the asset's region set
+        # (file-level aggregation: same forgiveness as Allen's location-string
+        # matching), but the unresolved labels are captured per asset for
+        # visibility, parallel to Allen's `unmatched_locations` field.
+        brain_names = result.get("brain_region") or []
         brain_ids = result.get("brain_region_id") or []
-        if brain_ids:
-            regions, unmatched_brain_region_ids = _map_regions_by_abbreviation(
-                brain_ids, abbrev_to_id, id_to_structure,
-            )
+        if brain_names or brain_ids:
+            if name_to_id is not None:
+                regions, unmatched_brain_region_ids = _map_regions_for_macaque(
+                    brain_names, brain_ids,
+                    name_to_id, abbrev_to_id, id_to_structure,
+                )
+            else:
+                regions, unmatched_brain_region_ids = _map_regions_by_abbreviation(
+                    brain_ids, abbrev_to_id, id_to_structure,
+                )
         else:
             regions = []
             unmatched_brain_region_ids = []
@@ -1946,6 +2540,159 @@ def fetch_dandi_data(
 
 
 # ---------------------------------------------------------------------------
+# Implicit-routing pass for non-001636 macaque dandisets
+# ---------------------------------------------------------------------------
+
+
+def _load_locations_cache():
+    cache = {}
+    if MACAQUE_LOCATIONS_CACHE.exists():
+        with open(MACAQUE_LOCATIONS_CACHE) as f:
+            for line in f:
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                aid = entry.get("asset_id")
+                if aid:
+                    cache[aid] = entry
+    return cache
+
+
+def _append_locations_cache(entry):
+    with open(MACAQUE_LOCATIONS_CACHE, "a") as f:
+        f.write(json.dumps(entry) + "\n")
+
+
+def fetch_macaque_implicit_data(
+    abbrev_to_id, id_to_structure, name_to_id,
+    aliases=None,
+):
+    """Discover all public macaque dandisets (excluding the production-known
+    001636) and return per-asset region records resolved against this atlas.
+
+    Two-pass routing:
+      - Explicit (this function does NOT cover): handled by fetch_dandi_data
+        for 001636 via the AnatomicalCoordinatesTable extension.
+      - Implicit (this function): for every other macaque dandiset, read
+        free-text location strings from electrodes/location +
+        optophysiology/<plane>/location + intracellular_ephys/<elec>/location,
+        resolve each against (name_to_id, abbrev_to_id, aliases). Add the
+        asset to this atlas's records if at least one string resolved.
+
+    The location-string extraction is atlas-independent and cached at
+    MACAQUE_LOCATIONS_CACHE so the three macaque atlas builds reuse one
+    stream per asset. Resolution is per-atlas (this function takes
+    atlas-specific lookups). Embargoed dandisets are skipped because they
+    don't appear in the public DANDI listing — handle those manually via the
+    debug scripts in ongoing_issues/.
+
+    Returns dict {dandiset_id: [asset_record, ...]}, suitable for merging
+    into the dandiset_assets dict produced by fetch_dandi_data.
+    """
+    from dandi_helpers import iter_all_dandisets
+    cache = _load_locations_cache()
+
+    macaque_ids = []
+    for ds in iter_all_dandisets():
+        ds_id = ds.get("identifier")
+        if not ds_id or ds_id == DANDISET_ID:
+            continue
+        if not _is_macaque_metadata(ds):
+            continue
+        macaque_ids.append(ds_id)
+    print(f"  [macaque-implicit] discovered {len(macaque_ids)} candidate macaque dandisets")
+
+    out = {}
+
+    def _process_asset(dandiset_id, asset):
+        aid = asset["asset_id"]
+        path = asset["path"]
+        cached = cache.get(aid)
+        if cached is None:
+            url = get_download_url(dandiset_id, aid)
+            try:
+                locations = extract_macaque_location_strings(url)
+            except Exception as exc:
+                print(f"    [macaque-implicit] {aid[:8]} stream error: {exc}")
+                locations = []
+            entry = {
+                "asset_id": aid, "dandiset_id": dandiset_id,
+                "locations": locations,
+            }
+            _append_locations_cache(entry)
+            cache[aid] = entry
+            cached = entry
+        return path, aid, cached.get("locations") or []
+
+    for dandiset_id in macaque_ids:
+        try:
+            assets = list(get_nwb_assets_paged(dandiset_id))
+        except Exception as exc:
+            print(f"  [macaque-implicit] failed to list {dandiset_id}: {exc}")
+            continue
+        if not assets:
+            continue
+
+        records = []
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = [
+                pool.submit(_process_asset, dandiset_id, a) for a in assets
+            ]
+            for fut in as_completed(futures):
+                try:
+                    path, aid, locations = fut.result()
+                except Exception as exc:
+                    print(f"  [macaque-implicit] {dandiset_id} asset error: {exc}")
+                    continue
+                if not locations:
+                    continue
+                regions, unmatched = _map_regions_for_macaque(
+                    locations, [], name_to_id, abbrev_to_id, id_to_structure,
+                    aliases=aliases,
+                )
+                if not regions:
+                    continue
+                records.append({
+                    "path": path,
+                    "asset_id": aid,
+                    "regions": regions,
+                    "unmatched_brain_region_ids": unmatched,
+                    "session": extract_session(path),
+                })
+
+        if records:
+            out[dandiset_id] = records
+            print(f"  [macaque-implicit] {dandiset_id}: {len(records)} asset(s) matched")
+
+    return out
+
+
+def _is_macaque_metadata(dandiset_metadata):
+    """Cheap species check using the metadata dict yielded by
+    iter_all_dandisets, falling back to a per-dandiset API call if the listing
+    payload doesn't include species inline.
+    """
+    summary = (
+        (dandiset_metadata.get("most_recent_published_version") or {})
+        .get("metadata", {})
+        .get("assetsSummary", {})
+    )
+    species = summary.get("species") if isinstance(summary, dict) else None
+    if species:
+        for sp in species:
+            ident = sp.get("identifier", "") or ""
+            name = sp.get("name", "") or ""
+            if "9544" in ident or "macaca" in name.lower():
+                return True
+        return False
+    # Fallback: per-dandiset metadata fetch.
+    from dandi_helpers import check_species_macaque
+    ds_id = dandiset_metadata.get("identifier")
+    return bool(ds_id) and check_species_macaque(ds_id)
+
+
+# ---------------------------------------------------------------------------
 # Convenience: build the in-memory atlas structure graph
 # ---------------------------------------------------------------------------
 
@@ -1955,10 +2702,13 @@ def build_atlas_graph(atlas_key):
 
     Returns
     -------
-    (config, tree, id_to_structure, parent_map, abbrev_to_id, entries)
+    (config, tree, id_to_structure, parent_map, abbrev_to_id, name_to_id, entries)
         `entries` is the parsed label list (D99 / CHARM / MEBRAINS shape) so
         callers that need it for mesh generation (e.g. NMT requires CHARM
-        entries to look up per-level surfaces) get it without re-parsing.
+        entries to look up per-level surfaces) get it without re-parsing. For
+        the unified NMT (CHARM + SARM) path, `entries` is the dict
+        ``{"charm": [...], "sarm": [...]}`` so the orchestrator can route
+        each list to its respective per-region surface directory.
     """
     config = ATLAS_CONFIGS[atlas_key]
     labels_type = config["labels_type"]
@@ -1967,26 +2717,43 @@ def build_atlas_graph(atlas_key):
         entries = parse_d99_labels()
     elif labels_type == "charm":
         entries = parse_charm_labels()
+    elif labels_type == "nmt_unified":
+        charm_entries = parse_charm_labels()
+        sarm_entries = parse_sarm_labels()
+        entries = {"charm": charm_entries, "sarm": sarm_entries}
     else:
         entries = parse_mebrains_labels()
 
     if labels_type == "charm":
-        tree, id_to_structure, parent_map, abbrev_to_id = build_charm_structure_graph(
-            entries, root_name=config["root_name"],
+        tree, id_to_structure, parent_map, abbrev_to_id, name_to_id = (
+            build_charm_structure_graph(entries, root_name=config["root_name"])
+        )
+    elif labels_type == "nmt_unified":
+        tree, id_to_structure, parent_map, abbrev_to_id, name_to_id = (
+            build_nmt_unified_structure_graph(
+                entries["charm"], entries["sarm"],
+                root_name=config["root_name"],
+            )
         )
     elif labels_type == "mebrains":
         mebrains_colors = load_mebrains_palette_from_siibra()
-        tree, id_to_structure, parent_map, abbrev_to_id = build_structure_graph(
-            entries,
-            root_name=config["root_name"],
-            color_overrides=mebrains_colors,
-            labels_type="mebrains",
+        tree, id_to_structure, parent_map, abbrev_to_id, name_to_id = (
+            build_structure_graph(
+                entries,
+                root_name=config["root_name"],
+                color_overrides=mebrains_colors,
+                labels_type="mebrains",
+            )
         )
     else:
-        tree, id_to_structure, parent_map, abbrev_to_id = build_structure_graph(
-            entries,
-            root_name=config["root_name"],
-            labels_type=labels_type,
+        tree, id_to_structure, parent_map, abbrev_to_id, name_to_id = (
+            build_structure_graph(
+                entries,
+                root_name=config["root_name"],
+                labels_type=labels_type,
+            )
         )
 
-    return config, tree, id_to_structure, parent_map, abbrev_to_id, entries
+    return (
+        config, tree, id_to_structure, parent_map, abbrev_to_id, name_to_id, entries,
+    )

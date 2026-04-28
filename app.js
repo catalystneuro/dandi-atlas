@@ -189,14 +189,6 @@ async function loadAtlas(atlasKey) {
   // incorrectly on the new atlas.
   if (raycaster) raycaster.params.Points.threshold = activeAtlas.electrodePickThreshold;
 
-  // Viewer-side X mirror for macaque atlases. The on-disk meshes/electrodes
-  // stay in atlas-native RAS+ mm; the mirror produces the same on-screen
-  // image as a build-time X-flip would, but reversibly and without baking
-  // anything into the data. Allen mouse uses PIR µm and stays unmirrored.
-  if (worldRoot) {
-    worldRoot.scale.x = activeAtlas.coordSystem === 'allen' ? 1 : -1;
-  }
-
   showLoading();
   updateLoadingText('Fetching data...');
 

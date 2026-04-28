@@ -37,7 +37,11 @@ from pathlib import Path
 
 # Reuse helpers from macaque_atlas_lib (atlas configs + DANDI fetch path)
 # and dandi_helpers (parent map + ancestor walk).
-from macaque_atlas_lib import ATLAS_CONFIGS, DANDISET_ID, fetch_dandi_data
+from macaque_atlas_lib import (
+    ATLAS_CONFIGS, DANDISET_ID, MACAQUE_LOCATION_ALIASES,
+    fetch_dandi_data, fetch_macaque_implicit_data, _normalize_region_name,
+)
+from dandi_helpers import build_dandi_regions
 from dandi_helpers import build_parent_map, get_ancestors
 
 
@@ -47,20 +51,25 @@ LAST_UPDATED_FILE = PROJECT_ROOT / "data" / "last_updated.json"
 
 def reconstruct_lookups_from_graph(structure_graph):
     """Walk the saved structure_graph.json and rebuild the lookups that
-    fetch_dandi_data needs (id_to_structure, abbrev_to_id).
+    fetch_dandi_data needs (id_to_structure, abbrev_to_id, name_to_id).
 
     The saved tree carries one node per structure with id, acronym, name,
     parent_structure_id, and children. We rebuild:
       - id_to_structure: dict {id: structure_record}, where structure_record is
         the minimal {id, acronym, name, parent_structure_id} shape that
-        downstream helpers (_map_regions_by_abbreviation, build_dandi_regions)
+        downstream helpers (_map_regions_for_macaque, build_dandi_regions)
         consume.
       - abbrev_to_id: dict {abbreviation_or_id_str: id}. Includes acronym → id
-        (the primary path NWBs use) and str(id) → id (defensive fallback for
-        files that store the integer ID as a string).
+        (used as a fallback when the NWB file does not also ship the full
+        region name) and str(id) → id (defensive fallback for files that
+        store the integer ID as a string).
+      - name_to_id: dict {normalized_full_name: id}. The primary lookup for
+        the macaque resolver, since full names are collision-free across
+        CHARM and SARM.
     """
     id_to_structure = {}
     abbrev_to_id = {}
+    name_to_id = {}
 
     def walk(node):
         sid = node["id"]
@@ -72,6 +81,9 @@ def reconstruct_lookups_from_graph(structure_graph):
         if "acronym" in node:
             abbrev_to_id[node["acronym"]] = sid
         abbrev_to_id[str(sid)] = sid
+        norm_name = _normalize_region_name(node.get("name"))
+        if norm_name is not None and norm_name not in name_to_id:
+            name_to_id[norm_name] = sid
         for child in node.get("children", []):
             walk(child)
 
@@ -81,7 +93,7 @@ def reconstruct_lookups_from_graph(structure_graph):
     else:
         walk(structure_graph)
 
-    return id_to_structure, abbrev_to_id
+    return id_to_structure, abbrev_to_id, name_to_id
 
 
 def update_mesh_manifest(data_dir, data_structures, parent_map):
@@ -151,7 +163,9 @@ def update_atlas(atlas_key, mode):
     print(f"Updating {atlas_key} (mode={mode})")
     print(f"  Reading structure tree from {structure_graph_path.relative_to(PROJECT_ROOT)}")
     structure_graph = json.load(open(structure_graph_path))
-    id_to_structure, abbrev_to_id = reconstruct_lookups_from_graph(structure_graph)
+    id_to_structure, abbrev_to_id, name_to_id = reconstruct_lookups_from_graph(
+        structure_graph
+    )
     parent_map = build_parent_map(list(id_to_structure.values()))
 
     # In full mode, clear the cache so every asset is re-fetched.
@@ -166,7 +180,23 @@ def update_atlas(atlas_key, mode):
     # from its return values below.
     dandiset_assets, dandisets_with_electrodes, dandi_regions = fetch_dandi_data(
         config, abbrev_to_id, id_to_structure, parent_map,
+        name_to_id=name_to_id,
     )
+
+    # Implicit-routing pass: discover all other public macaque dandisets and
+    # add region-tag-only records wherever their free-text location strings
+    # resolve in this atlas's vocabulary. Embargoed dandisets are NOT covered
+    # here (they don't appear in the public listing); inject those manually
+    # via ongoing_issues/inject_001693_d99.py if needed.
+    implicit_addition = fetch_macaque_implicit_data(
+        abbrev_to_id, id_to_structure, name_to_id,
+        aliases=MACAQUE_LOCATION_ALIASES,
+    )
+    for ds_id, recs in implicit_addition.items():
+        dandiset_assets[ds_id] = recs
+    # Rebuild dandi_regions over the merged dandiset_assets so counts and
+    # ancestor propagation account for the implicit additions.
+    dandi_regions = build_dandi_regions(dandiset_assets, id_to_structure, parent_map)
 
     with open(data_dir / "dandiset_assets.json", "w") as f:
         json.dump(dandiset_assets, f)
