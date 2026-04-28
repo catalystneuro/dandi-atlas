@@ -2072,14 +2072,26 @@ def _read_hdf5_strings(group, key):
 
 
 def extract_macaque_location_strings(url):
-    """Read free-text location strings from the three standard NWB places used
-    by macaque dandisets that do NOT ship the AnatomicalCoordinatesTable
-    extension. Returns a deduplicated list of distinct, non-empty strings.
+    """Read region-bearing strings from every standard NWB place used by
+    macaque dandisets. Returns a deduplicated list of distinct, non-empty
+    strings.
 
-    Sources read (mirrors scripts/dandi_helpers.py:extract_locations):
-      - general/extracellular_ephys/electrodes/location
-      - general/optophysiology/<plane>/location
-      - general/intracellular_ephys/<electrode>/location
+    Sources read:
+      Free-text labels (mirrors scripts/dandi_helpers.py:extract_locations):
+        - general/extracellular_ephys/electrodes/location
+        - general/optophysiology/<plane>/location
+        - general/intracellular_ephys/<electrode>/location
+
+      AnatomicalCoordinatesTable extension (the schema 001636 uses; covers
+      any future macaque dandiset that adopts the extension):
+        - general/localization/<group>/brain_region
+        - general/localization/<group>/brain_region_id
+
+    The extension's per-electrode coords and table grouping are NOT read by
+    this function — that is fetch_dandi_data via extract_atlas_coords for
+    the production-known 001636 path. This function only collects strings
+    so the implicit-routing pass can resolve them against atlas vocabularies
+    and surface region-tag-only dandisets.
 
     Atlas-independent; the same set of strings is then resolved separately
     against each macaque atlas's vocabulary (D99, NMT-with-SARM, MEBRAINS).
@@ -2099,17 +2111,20 @@ def extract_macaque_location_strings(url):
         seen.add(s)
         out.append(s)
 
+    def _push_iterable(raw):
+        if hasattr(raw, "__iter__") and not isinstance(raw, (str, bytes)):
+            for v in raw:
+                _push(v)
+        else:
+            _push(raw)
+
     rf = remfile.File(url)
     with h5py.File(rf, "r") as f:
+        # Free-text labels
         if "general/extracellular_ephys/electrodes" in f:
             elec = f["general/extracellular_ephys/electrodes"]
             if "location" in elec:
-                raw = elec["location"][()]
-                if hasattr(raw, "__iter__") and not isinstance(raw, (str, bytes)):
-                    for v in raw:
-                        _push(v)
-                else:
-                    _push(raw)
+                _push_iterable(elec["location"][()])
         if "general/optophysiology" in f:
             for name in f["general/optophysiology"]:
                 plane = f[f"general/optophysiology/{name}"]
@@ -2120,6 +2135,21 @@ def extract_macaque_location_strings(url):
                 item = f[f"general/intracellular_ephys/{name}"]
                 if isinstance(item, h5py.Group) and "location" in item:
                     _push(item["location"][()])
+        # AnatomicalCoordinatesTable extension. Any subgroup of
+        # general/localization that has brain_region or brain_region_id
+        # contributes its values. Group naming (e.g. D99v2AtlasCoordinates)
+        # could let an explicit-routing pass infer atlas membership, but the
+        # implicit pass intentionally ignores the group name and resolves
+        # the strings against every atlas vocabulary instead.
+        if "general/localization" in f:
+            loc_group = f["general/localization"]
+            for name in loc_group:
+                sub = loc_group[name]
+                if not isinstance(sub, h5py.Group):
+                    continue
+                for col in ("brain_region", "brain_region_id"):
+                    if col in sub:
+                        _push_iterable(sub[col][()])
     return out
 
 
@@ -2647,8 +2677,13 @@ def fetch_macaque_implicit_data(
                     continue
                 if not locations:
                     continue
+                # Pass each location string as both name and abbrev candidate
+                # so the resolver tries name match first, then abbrev. Catches
+                # bare acronyms like "SNpc" (matches abbrev_to_id in D99) or
+                # "F1_(4)" (matches abbrev_to_id when an extension-using NWB
+                # ships brain_region_id) without needing a per-acronym alias.
                 regions, unmatched = _map_regions_for_macaque(
-                    locations, [], name_to_id, abbrev_to_id, id_to_structure,
+                    locations, locations, name_to_id, abbrev_to_id, id_to_structure,
                     aliases=aliases,
                 )
                 if not regions:
