@@ -35,9 +35,9 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
-# Reuse helpers from build_macaque_atlas (atlas configs + DANDI fetch path)
+# Reuse helpers from macaque_atlas_lib (atlas configs + DANDI fetch path)
 # and dandi_helpers (parent map + ancestor walk).
-from build_macaque_atlas import ATLAS_CONFIGS, DANDISET_ID, fetch_dandi_data
+from macaque_atlas_lib import ATLAS_CONFIGS, DANDISET_ID, fetch_dandi_data
 from dandi_helpers import build_parent_map, get_ancestors
 
 

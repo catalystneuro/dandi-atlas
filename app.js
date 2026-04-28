@@ -4,6 +4,12 @@ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 
 // ── State ──────────────────────────────────────────────────────────────────
 let scene, camera, renderer, controls, raycaster, mouse;
+// Group that wraps every atlas-anchored object (meshes + electrode Points).
+// Lights stay on `scene` so a negative scale on this root mirrors only the
+// rendered geometry, not the light directions. Used to apply a viewer-side
+// X mirror for macaque atlases without touching on-disk vertex coordinates;
+// see neurological_vs_radiological_convention.md for the rationale.
+let worldRoot;
 let structureGraph = [];   // Allen hierarchy tree
 let dandiRegions = {};     // structure_id -> {acronym, name, dandisets, ...}
 let meshManifest = {};     // {data_structures, ancestor_structures, root_id}
@@ -183,6 +189,14 @@ async function loadAtlas(atlasKey) {
   // incorrectly on the new atlas.
   if (raycaster) raycaster.params.Points.threshold = activeAtlas.electrodePickThreshold;
 
+  // Viewer-side X mirror for macaque atlases. The on-disk meshes/electrodes
+  // stay in atlas-native RAS+ mm; the mirror produces the same on-screen
+  // image as a build-time X-flip would, but reversibly and without baking
+  // anything into the data. Allen mouse uses PIR µm and stays unmirrored.
+  if (worldRoot) {
+    worldRoot.scale.x = activeAtlas.coordSystem === 'allen' ? 1 : -1;
+  }
+
   showLoading();
   updateLoadingText('Fetching data...');
 
@@ -198,9 +212,9 @@ async function loadAtlas(atlasKey) {
   idToStructure = {};
   dandisetToStructures = {};
 
-  // Remove existing meshes from scene
+  // Remove existing meshes from worldRoot
   for (const [id, mesh] of Object.entries(meshObjects)) {
-    scene.remove(mesh);
+    worldRoot.remove(mesh);
     mesh.geometry.dispose();
     if (mesh.material.dispose) mesh.material.dispose();
   }
@@ -385,6 +399,9 @@ function setupScene() {
   renderer.setClearColor(0x1a1a2e, 1);
 
   scene = new THREE.Scene();
+  worldRoot = new THREE.Group();
+  worldRoot.name = 'worldRoot';
+  scene.add(worldRoot);
 
   camera = new THREE.PerspectiveCamera(
     45,
@@ -512,7 +529,7 @@ function loadMesh(structureId) {
         mesh.userData.isRoot = isRoot;
         mesh.userData.originalMaterial = material.clone();
 
-        scene.add(mesh);
+        worldRoot.add(mesh);
         meshObjects[structureId] = mesh;
 
         // When meshes load asynchronously mid-selection, give them the same
@@ -2008,7 +2025,7 @@ async function showElectrodePointsForAssets(dandisetId, assetRefs, { colorBySess
 
   electrodePoints = new THREE.Points(geometry, material);
   electrodePoints.userData.pointInfo = pointInfo;
-  scene.add(electrodePoints);
+  worldRoot.add(electrodePoints);
   document.getElementById('electrode-control-row').classList.remove('hidden');
 
   // Auto-drop the Regions slider when electrodes appear so the active region
@@ -2033,7 +2050,7 @@ function isZeroCoordinate(coord) {
 
 function clearElectrodePoints() {
   if (electrodePoints) {
-    scene.remove(electrodePoints);
+    worldRoot.remove(electrodePoints);
     electrodePoints.geometry.dispose();
     electrodePoints.material.dispose();
     electrodePoints = null;
@@ -2527,9 +2544,9 @@ document.getElementById('electrode-opacity').addEventListener('input', (e) => {
   sliderElectrodeOpacity = parseFloat(e.target.value);
   if (electrodePoints) {
     if (sliderElectrodeOpacity === 0) {
-      scene.remove(electrodePoints);
+      worldRoot.remove(electrodePoints);
     } else {
-      if (!electrodePoints.parent) scene.add(electrodePoints);
+      if (!electrodePoints.parent) worldRoot.add(electrodePoints);
       electrodePoints.material.opacity = sliderElectrodeOpacity;
     }
   }
@@ -2662,6 +2679,7 @@ init().catch(err => {
 if (new URLSearchParams(window.location.search).get('debug') === '1') {
   window.__debug = {
     get scene() { return scene; },
+    get worldRoot() { return worldRoot; },
     get camera() { return camera; },
     get controls() { return controls; },
     get meshObjects() { return meshObjects; },
