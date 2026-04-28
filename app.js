@@ -212,6 +212,16 @@ async function loadAtlas(atlasKey) {
   idToStructure = {};
   dandisetToStructures = {};
 
+  // Reset the Regions slider to full so any auto-drop from the previous
+  // atlas's electrode view doesn't bleed into the new atlas's init view.
+  // Same reasoning as the reset in enterInitView; loadAtlas is the other
+  // entry point that lands the user on a fresh "everything" state.
+  const regionSlider = document.getElementById('region-opacity');
+  if (regionSlider && parseFloat(regionSlider.value) !== 1) {
+    regionSlider.value = 1;
+    sliderRegionOpacity = 1;
+  }
+
   // Remove existing meshes from worldRoot
   for (const [id, mesh] of Object.entries(meshObjects)) {
     worldRoot.remove(mesh);
@@ -1216,6 +1226,16 @@ function enterInitView() {
     selectedDandiset = null;
     dandisetSubjectCounts = null;
     hiddenRegionIds = new Set();
+
+    // Restore the Regions slider to full. Any prior auto-drop from an
+    // electrode view should not bleed into the "everything" view — root
+    // mesh becomes 'active' here and would otherwise inherit the dropped
+    // value as its applied opacity.
+    const regionSlider = document.getElementById('region-opacity');
+    if (regionSlider && parseFloat(regionSlider.value) !== 1) {
+      regionSlider.value = 1;
+      regionSlider.dispatchEvent(new Event('input', { bubbles: true }));
+    }
 
     clearElectrodePoints();
     document.getElementById('region-visibility-overlay').classList.add('hidden');
@@ -2287,8 +2307,12 @@ function createTreeNode(node, depth) {
       const isExpanded = childrenEl.classList.toggle('expanded');
       toggle.classList.toggle('expanded', isExpanded);
 
-      // If in dandiset mode, filter subjects by this region
-      if (selectedDandiset) {
+      // Tree root → full init view, even when a dandiset is selected. Clicking
+      // "everything" should always exit the current scope; otherwise it would
+      // be a dandiset-region filter on root, which is meaningless.
+      if (node.id === meshManifest.root_id) {
+        enterInitView();
+      } else if (selectedDandiset) {
         filterDandisetPanelByRegion(node.id);
       } else {
         enterRegionView(node.id, { expandTree: false });
@@ -2298,7 +2322,9 @@ function createTreeNode(node, depth) {
   } else {
     content.addEventListener('click', (e) => {
       e.stopPropagation();
-      if (selectedDandiset) {
+      if (node.id === meshManifest.root_id) {
+        enterInitView();
+      } else if (selectedDandiset) {
         filterDandisetPanelByRegion(node.id);
       } else {
         enterRegionView(node.id, { expandTree: false });
