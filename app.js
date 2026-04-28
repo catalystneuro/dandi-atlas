@@ -285,29 +285,39 @@ async function loadAtlas(atlasKey) {
 }
 
 // ── Initialization ─────────────────────────────────────────────────────────
+let sceneInitialized = false;
+
 async function init() {
-  // Read URL parameter for initial atlas; falls through to module-level default if absent or invalid.
   const urlParams = new URLSearchParams(window.location.search);
   const atlasParam = urlParams.get('atlas');
-  if (atlasParam && ATLAS_CONFIGS[atlasParam]) {
-    activeAtlasKey = atlasParam;
-    activeAtlas = ATLAS_CONFIGS[atlasParam];
+  const hasHash = !!window.location.hash.slice(1);
+  const directEntry = (atlasParam && ATLAS_CONFIGS[atlasParam]) || hasHash;
+
+  if (directEntry) {
+    if (atlasParam && ATLAS_CONFIGS[atlasParam]) {
+      activeAtlasKey = atlasParam;
+      activeAtlas = ATLAS_CONFIGS[atlasParam];
+    }
+    await enterAtlas(activeAtlasKey, { pushState: false });
+    if (hasHash) applyURLState();
+  } else {
+    // Bare load: render the landing and defer scene/atlas setup until a card
+    // is clicked. The loading overlay is for atlas mesh fetches, not for the
+    // landing itself.
+    hideLoading();
+    setupLanding();
   }
+}
 
-  // Set dropdown to match the chosen atlas.
-  const selector = document.getElementById('atlas-selector');
-  if (selector) selector.value = activeAtlasKey;
-
-  // Page-lifetime infrastructure: one-time setup that persists across atlas switches.
-  updateLoadingText('Setting up 3D scene...');
+function ensureSceneInitialized() {
+  if (sceneInitialized) return;
   setupScene();
   setupSearch();
   animate();
 
-  // URL navigation listener (browser back/forward, hash edits).
   window.addEventListener('hashchange', () => applyURLState());
 
-  // Atlas selector change handler.
+  const selector = document.getElementById('atlas-selector');
   if (selector) {
     selector.addEventListener('change', (e) => {
       const newAtlas = e.target.value;
@@ -321,8 +331,6 @@ async function init() {
     });
   }
 
-  // Fetch atlas-independent metadata (last-updated timestamp). Fire-and-forget;
-  // not awaited so it doesn't delay the main load path.
   fetch('data/last_updated.json').then(r => r.json()).catch(() => null).then(resp => {
     if (resp && resp.timestamp) {
       const date = new Date(resp.timestamp);
@@ -332,17 +340,73 @@ async function init() {
     }
   });
 
-  // Delegate atlas data loading to loadAtlas — single source of truth for
-  // fetching atlas JSON, building lookups, loading meshes, and applying the
-  // initial root selection. loadAtlas hides the loading overlay when done.
-  await loadAtlas(activeAtlasKey);
+  sceneInitialized = true;
+}
 
-  // Deep-link restore: if the URL has a hash (region/dandiset/session deep
-  // link), override loadAtlas's default root selection. The user briefly sees
-  // the root view between loadAtlas's hideLoading and applyURLState's
-  // selection, but only on deep-link loads — direct page loads end at root.
-  if (location.hash.slice(1)) {
-    applyURLState();
+async function enterAtlas(atlasKey, { pushState = true } = {}) {
+  document.body.classList.remove('landing-active');
+  ensureSceneInitialized();
+
+  const selector = document.getElementById('atlas-selector');
+  if (selector) selector.value = atlasKey;
+
+  if (pushState) {
+    const url = new URL(window.location);
+    url.searchParams.set('atlas', atlasKey);
+    window.history.pushState({}, '', url);
+  }
+
+  await loadAtlas(atlasKey);
+}
+
+async function setupLanding() {
+  const grid = document.getElementById('atlas-landing-grid');
+  if (!grid) return;
+  let index;
+  try {
+    const resp = await fetch('data/atlases_index.json');
+    index = await resp.json();
+  } catch (err) {
+    console.error('Failed to load atlases_index.json', err);
+    return;
+  }
+
+  const fmt = (n) => n.toLocaleString('en-US');
+  grid.innerHTML = '';
+  for (const atlas of index.atlases) {
+    const card = document.createElement('button');
+    card.type = 'button';
+    card.className = 'atlas-card';
+    card.dataset.atlasKey = atlas.key;
+    const regionLabel = atlas.regions_with_data === 1 ? 'region with data' : 'regions with data';
+    card.innerHTML = `
+      <img class="atlas-card-image" src="${atlas.preview}" alt="${atlas.name} brain preview" loading="lazy">
+      <div class="atlas-card-body">
+        <h3 class="atlas-card-title">${atlas.name}</h3>
+        <div class="atlas-card-species">${atlas.species}</div>
+        <div class="atlas-card-stats">
+          <div class="atlas-card-stat">
+            <span class="atlas-card-stat-value">${fmt(atlas.dandiset_count)}</span>
+            <span class="atlas-card-stat-label">dandisets</span>
+          </div>
+          <div class="atlas-card-stat">
+            <span class="atlas-card-stat-value">${fmt(atlas.file_count)}</span>
+            <span class="atlas-card-stat-label">NWB files</span>
+          </div>
+          <div class="atlas-card-stat">
+            <span class="atlas-card-stat-value">${fmt(atlas.regions_with_data)}</span>
+            <span class="atlas-card-stat-label">${regionLabel}</span>
+          </div>
+        </div>
+      </div>`;
+    card.addEventListener('click', () => {
+      if (ATLAS_CONFIGS[atlas.key]) {
+        activeAtlasKey = atlas.key;
+        activeAtlas = ATLAS_CONFIGS[atlas.key];
+        enterAtlas(atlas.key);
+      }
+    });
+    grid.appendChild(card);
   }
 }
 
