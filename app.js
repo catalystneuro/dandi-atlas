@@ -372,13 +372,13 @@ async function setupLanding() {
   }
 
   const fmt = (n) => n.toLocaleString('en-US');
+  const plural = (n, singular, pluralForm) => (n === 1 ? singular : pluralForm);
   grid.innerHTML = '';
   for (const atlas of index.atlases) {
     const card = document.createElement('button');
     card.type = 'button';
     card.className = 'atlas-card';
     card.dataset.atlasKey = atlas.key;
-    const regionLabel = atlas.regions_with_data === 1 ? 'region with data' : 'regions with data';
     card.innerHTML = `
       <img class="atlas-card-image" src="${atlas.preview}" alt="${atlas.name} brain preview" loading="lazy">
       <div class="atlas-card-body">
@@ -387,15 +387,15 @@ async function setupLanding() {
         <div class="atlas-card-stats">
           <div class="atlas-card-stat">
             <span class="atlas-card-stat-value">${fmt(atlas.dandiset_count)}</span>
-            <span class="atlas-card-stat-label">dandisets</span>
+            <span class="atlas-card-stat-label">${plural(atlas.dandiset_count, 'dandiset', 'dandisets')}</span>
           </div>
           <div class="atlas-card-stat">
             <span class="atlas-card-stat-value">${fmt(atlas.file_count)}</span>
-            <span class="atlas-card-stat-label">NWB files</span>
+            <span class="atlas-card-stat-label">${plural(atlas.file_count, 'NWB file', 'NWB files')}</span>
           </div>
           <div class="atlas-card-stat">
             <span class="atlas-card-stat-value">${fmt(atlas.regions_with_data)}</span>
-            <span class="atlas-card-stat-label">${regionLabel}</span>
+            <span class="atlas-card-stat-label">${plural(atlas.regions_with_data, 'region with data', 'regions with data')}</span>
           </div>
         </div>
       </div>`;
