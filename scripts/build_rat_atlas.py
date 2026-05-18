@@ -28,12 +28,13 @@ import json
 import sys
 from pathlib import Path
 
-from dandi_helpers import get_ancestors
+from dandi_helpers import build_dandi_regions, get_ancestors
 from macaque_atlas_lib import OUTSIDE_ID, ROOT_ID
 import rat_atlas_lib
 from rat_atlas_lib import (
     ATLAS_CONFIGS,
-    DANDISET_ID,
+    DANDISET_IDS,
+    EMBARGOED_DANDISETS,
     fetch_local_rat_data,
     fetch_rat_dandi_data,
     generate_meshes_with_progress,
@@ -127,13 +128,26 @@ def main():
             print(f"  Reused {asset_count} asset entries, {len(dandi_regions)} regions")
         except FileNotFoundError:
             print("  No existing DANDI outputs to reuse; writing empty placeholders")
-            dandiset_assets = {DANDISET_ID: []}
+            dandiset_assets = {dsid: [] for dsid in DANDISET_IDS}
             dandisets_with_electrodes = []
             dandi_regions = {}
     elif args.local_nwb is not None:
-        dandiset_assets, dandisets_with_electrodes, dandi_regions = fetch_local_rat_data(
+        # Additive: feed embargoed dandisets (e.g. 001699) from local NWB files,
+        # then stream every non-embargoed entry in DANDISET_IDS from DANDI.
+        local_assets, _, _ = fetch_local_rat_data(
             args.local_nwb, name_to_id, abbrev_to_id, id_to_structure, parent_map,
         )
+        streaming_ids = [d for d in DANDISET_IDS if d not in EMBARGOED_DANDISETS]
+        if streaming_ids:
+            stream_assets, _, _ = fetch_rat_dandi_data(
+                config, name_to_id, abbrev_to_id, id_to_structure, parent_map,
+                dandiset_ids=streaming_ids,
+            )
+        else:
+            stream_assets = {}
+        dandiset_assets = {**local_assets, **stream_assets}
+        dandisets_with_electrodes = []
+        dandi_regions = build_dandi_regions(dandiset_assets, id_to_structure, parent_map)
     else:
         dandiset_assets, dandisets_with_electrodes, dandi_regions = fetch_rat_dandi_data(
             config, name_to_id, abbrev_to_id, id_to_structure, parent_map,

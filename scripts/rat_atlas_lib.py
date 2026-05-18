@@ -48,7 +48,11 @@ SCRIPTS_DIR = Path(__file__).resolve().parent
 DEFAULT_WHS_DATA = PROJECT_ROOT / "atlas_sources" / "MBAT_WHS_SD_rat_atlas_v4_pack" / "Data"
 WHS_DATA = Path(os.environ.get("WHS_SD_DATA", DEFAULT_WHS_DATA))
 
-DANDISET_ID = "001699"
+# Explicit list of rat dandisets to ingest. 001699 (Dudchenko postsubiculum) is
+# embargoed and built via fetch_local_rat_data; everything else streams from
+# DANDI via fetch_rat_dandi_data.
+DANDISET_IDS = ["001699", "001754"]
+EMBARGOED_DANDISETS = {"001699"}
 
 # Alias map for free-text NWB location strings whose canonical WHS-SD region
 # name differs from the upstream label. Keys are normalized via
@@ -62,6 +66,7 @@ DANDISET_ID = "001699"
 # region attribution without inventing a separate parcel.
 WHS_LOCATION_ALIASES = {
     "postsubiculum": "Presubiculum",
+    "hippocampal area ca1": "Cornu ammonis 1",
 }
 
 ATLAS_CONFIGS = {
@@ -374,12 +379,18 @@ def _extract_rat_location_strings(url):
 
 
 def _load_cache(cache_file):
+    """Load the per-asset location cache keyed by (dandiset_id, asset_id).
+
+    Legacy entries without a `dandiset_id` field are from the single-dandiset
+    era and are assumed to belong to 001699.
+    """
     cache = {}
     if cache_file.exists():
         with open(cache_file, "r") as f:
             for line in f:
                 entry = json.loads(line)
-                cache[entry["asset_id"]] = entry
+                dandiset_id = entry.get("dandiset_id", "001699")
+                cache[(dandiset_id, entry["asset_id"])] = entry
     return cache
 
 
@@ -437,7 +448,7 @@ def _extract_local_location_strings(file_path):
 
 
 def fetch_local_rat_data(local_dir, name_to_id, abbrev_to_id, id_to_structure, parent_map,
-                        dandiset_id=DANDISET_ID):
+                        dandiset_id="001699"):
     """Build dandiset_assets/regions from local NWB files instead of DANDI.
 
     Useful while a dandiset is embargoed: the data is the same as what will
@@ -493,94 +504,104 @@ def fetch_local_rat_data(local_dir, name_to_id, abbrev_to_id, id_to_structure, p
     return dandiset_assets, dandisets_with_electrodes, dandi_regions
 
 
-def fetch_rat_dandi_data(config, name_to_id, abbrev_to_id, id_to_structure, parent_map):
-    """Fetch location data from DANDI 001699 and build the per-atlas JSON files.
+def fetch_rat_dandi_data(config, name_to_id, abbrev_to_id, id_to_structure, parent_map,
+                         dandiset_ids=None):
+    """Stream location data from each rat dandiset and aggregate.
 
-    Each NWB asset's `electrodes/location` column is read once; the unique
-    strings are matched against the WHS-SD structure graph. Electrode
-    coordinate rendering is intentionally skipped — the DANDI 001699 electrodes
-    table has no `x/y/z` columns (only probe-relative `rel_x/rel_y/rel_z` in
-    µm), so there are no atlas coordinates to render.
+    For each dandiset in `dandiset_ids` (default: DANDISET_IDS), iterate its
+    NWB assets, read `general/extracellular_ephys/electrodes/location` via
+    `remfile` + h5py, and resolve each unique string against the WHS-SD
+    vocabulary. Results are cached per (dandiset_id, asset_id) in
+    `config["cache_file"]`.
+
+    Electrode coordinate rendering is intentionally skipped: the rat NWB files
+    encountered so far have no atlas-space x/y/z (only probe-relative coords),
+    so `dandisets_with_electrodes` is always empty.
 
     Returns (dandiset_assets, dandisets_with_electrodes, dandi_regions).
     """
+    if dandiset_ids is None:
+        dandiset_ids = DANDISET_IDS
+
     cache_file = config["cache_file"]
-
-    print(f"Fetching assets from dandiset {DANDISET_ID}...")
-    assets = list(get_nwb_assets_paged(DANDISET_ID))
-    print(f"  Found {len(assets)} NWB assets")
-
     cache = _load_cache(cache_file)
     print(f"  Cache has {len(cache)} entries")
 
-    results = {}
-    to_process = []
-    for asset in assets:
-        asset_id = asset["asset_id"]
-        if asset_id in cache:
-            results[asset_id] = cache[asset_id]
-        else:
-            to_process.append(asset)
+    dandiset_assets = {}
+    for dandiset_id in dandiset_ids:
+        print(f"Fetching assets from dandiset {dandiset_id}...")
+        assets = list(get_nwb_assets_paged(dandiset_id))
+        print(f"  Found {len(assets)} NWB assets")
 
-    print(f"  Need to fetch {len(to_process)} new assets")
+        results = {}
+        to_process = []
+        for asset in assets:
+            asset_id = asset["asset_id"]
+            cache_key = (dandiset_id, asset_id)
+            if cache_key in cache:
+                results[asset_id] = cache[cache_key]
+            else:
+                to_process.append(asset)
+        print(f"  Need to fetch {len(to_process)} new assets")
 
-    def _process_one(asset):
-        asset_id = asset["asset_id"]
-        url = get_download_url(DANDISET_ID, asset_id)
-        try:
-            locations = _extract_rat_location_strings(url)
-            return {"asset_id": asset_id, "locations": locations}
-        except Exception as exc:
-            print(f"  Error processing {asset['path']}: {exc}")
-            return {"asset_id": asset_id, "locations": [], "error": str(exc)}
+        def _process_one(asset, _dandiset_id=dandiset_id):
+            asset_id = asset["asset_id"]
+            url = get_download_url(_dandiset_id, asset_id)
+            try:
+                locations = _extract_rat_location_strings(url)
+                return {"dandiset_id": _dandiset_id, "asset_id": asset_id, "locations": locations}
+            except Exception as exc:
+                print(f"  Error processing {asset['path']}: {exc}")
+                return {"dandiset_id": _dandiset_id, "asset_id": asset_id, "locations": [], "error": str(exc)}
 
-    if to_process:
-        with ThreadPoolExecutor(max_workers=4) as pool:
-            futures = {pool.submit(_process_one, a): a for a in to_process}
-            done = 0
-            for future in as_completed(futures):
-                result = future.result()
-                results[result["asset_id"]] = result
-                _append_cache(cache_file, result)
-                done += 1
-                if done % 25 == 0:
-                    print(f"  Processed {done}/{len(to_process)} assets")
+        if to_process:
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                futures = {pool.submit(_process_one, a): a for a in to_process}
+                done = 0
+                for future in as_completed(futures):
+                    result = future.result()
+                    results[result["asset_id"]] = result
+                    _append_cache(cache_file, result)
+                    done += 1
+                    if done % 25 == 0:
+                        print(f"  Processed {done}/{len(to_process)} assets")
 
-    dandiset_assets = {DANDISET_ID: []}
-    skipped_no_loc = 0
-    for asset in assets:
-        asset_id = asset["asset_id"]
-        path = asset["path"]
-        result = results.get(asset_id, {})
-        locations = result.get("locations") or []
-        if not locations:
-            skipped_no_loc += 1
-            continue
-
-        regions = []
-        seen_ids = set()
-        unmatched = []
-        for loc in locations:
-            match = _resolve_location(loc, name_to_id, abbrev_to_id, id_to_structure)
-            if match is None:
-                if loc not in unmatched:
-                    unmatched.append(loc)
+        dandiset_assets[dandiset_id] = []
+        skipped_no_loc = 0
+        for asset in assets:
+            asset_id = asset["asset_id"]
+            path = asset["path"]
+            result = results.get(asset_id, {})
+            locations = result.get("locations") or []
+            if not locations:
+                skipped_no_loc += 1
                 continue
-            if match["id"] in seen_ids:
-                continue
-            seen_ids.add(match["id"])
-            regions.append(match)
 
-        dandiset_assets[DANDISET_ID].append({
-            "path": path,
-            "asset_id": asset_id,
-            "regions": regions,
-            "unmatched_locations": unmatched,
-            "session": extract_session(path),
-        })
+            regions = []
+            seen_ids = set()
+            unmatched = []
+            for loc in locations:
+                match = _resolve_location(loc, name_to_id, abbrev_to_id, id_to_structure)
+                if match is None:
+                    if loc not in unmatched:
+                        unmatched.append(loc)
+                    continue
+                if match["id"] in seen_ids:
+                    continue
+                seen_ids.add(match["id"])
+                regions.append(match)
 
-    if skipped_no_loc:
-        print(f"  Skipped {skipped_no_loc} assets without location strings")
+            dandiset_assets[dandiset_id].append({
+                "path": path,
+                "asset_id": asset_id,
+                "regions": regions,
+                "unmatched_locations": unmatched,
+                "session": extract_session(path),
+            })
+
+        matched_count = len(dandiset_assets[dandiset_id])
+        print(f"  {dandiset_id}: {matched_count} assets with location data"
+              + (f" (skipped {skipped_no_loc} without locations)" if skipped_no_loc else ""))
 
     dandisets_with_electrodes = []
     dandi_regions = build_dandi_regions(dandiset_assets, id_to_structure, parent_map)

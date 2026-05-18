@@ -3,7 +3,7 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 
 // Bump this string after any data rebuild to force browsers to drop cached GLBs and JSONs.
-const DATA_VERSION = '20250518';
+const DATA_VERSION = '20260518';
 
 // ── State ──────────────────────────────────────────────────────────────────
 let scene, camera, renderer, controls, raycaster, mouse;
