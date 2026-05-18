@@ -34,7 +34,6 @@ from macaque_atlas_lib import (
     ROOT_ID,
     ROOT_TARGET_FACES,
     TARGET_FACES,
-    _export_template_root_glb,
     _normalize_region_name,
 )
 
@@ -204,9 +203,17 @@ def generate_meshes_with_progress(nifti_file, meshes_dir, id_to_structure, templ
     if root_glb.exists():
         print(f"Root mesh already exists at {root_glb.name}; skipping")
     else:
-        print(f"Generating root mesh from template (this can take a few minutes): "
-              f"{template_nifti.name}")
-        mesh = _export_template_root_glb(template_nifti, root_glb, ROOT_TARGET_FACES)
+        print("Generating root mesh from parcellation binary mask...")
+        root_mask = atlas_data > 0
+        smoothed = gaussian_filter(root_mask.astype(float), sigma=1.0)
+        verts, faces, _, _ = marching_cubes(smoothed, level=0.5)
+        verts_homogeneous = np.column_stack([verts, np.ones(len(verts))])
+        verts_world = (affine @ verts_homogeneous.T).T[:, :3]
+        mesh = trimesh.Trimesh(vertices=verts_world, faces=faces)
+        if len(mesh.faces) > ROOT_TARGET_FACES:
+            mesh = mesh.simplify_quadric_decimation(face_count=ROOT_TARGET_FACES)
+        _ = mesh.vertex_normals
+        mesh.export(str(root_glb), file_type="glb")
         print(f"  Root mesh: {len(mesh.faces)} faces, saved to {root_glb.name}")
 
     leaf_bar = tqdm(unique_labels, desc="Leaf meshes", unit="region")

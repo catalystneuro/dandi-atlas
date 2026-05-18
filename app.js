@@ -2,6 +2,9 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 
+// Bump this string after any data rebuild to force browsers to drop cached GLBs and JSONs.
+const DATA_VERSION = '20250518';
+
 // ── State ──────────────────────────────────────────────────────────────────
 let scene, camera, renderer, controls, raycaster, mouse;
 // Group that wraps every atlas-anchored object (meshes + electrode Points).
@@ -247,12 +250,13 @@ async function loadAtlas(atlasKey) {
   meshObjects = {};
   failedMeshIds.clear();
 
+  const v = `?v=${DATA_VERSION}`;
   const [graphResp, regionsResp, manifestResp, assetsResp, electrodeManifestResp] = await Promise.all([
-    fetch(`${activeAtlas.dataPrefix}structure_graph.json`).then(r => r.json()),
-    fetch(`${activeAtlas.dataPrefix}dandi_regions.json`).then(r => r.json()),
-    fetch(`${activeAtlas.dataPrefix}mesh_manifest.json`).then(r => r.json()),
-    fetch(`${activeAtlas.dataPrefix}dandiset_assets.json`).then(r => r.json()),
-    fetch(`${activeAtlas.dataPrefix}dandisets_with_electrodes.json`).then(r => r.json()).catch(() => []),
+    fetch(`${activeAtlas.dataPrefix}structure_graph.json${v}`).then(r => r.json()),
+    fetch(`${activeAtlas.dataPrefix}dandi_regions.json${v}`).then(r => r.json()),
+    fetch(`${activeAtlas.dataPrefix}mesh_manifest.json${v}`).then(r => r.json()),
+    fetch(`${activeAtlas.dataPrefix}dandiset_assets.json${v}`).then(r => r.json()),
+    fetch(`${activeAtlas.dataPrefix}dandisets_with_electrodes.json${v}`).then(r => r.json()).catch(() => []),
   ]);
 
   structureGraph = graphResp;
@@ -483,7 +487,7 @@ function loadMesh(structureId) {
       return;
     }
 
-    const path = `${activeAtlas.dataPrefix}meshes/${structureId}.glb`;
+    const path = `${activeAtlas.dataPrefix}meshes/${structureId}.glb?v=${DATA_VERSION}`;
     gltfLoader.load(
       path,
       (gltf) => {
