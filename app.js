@@ -166,6 +166,7 @@ let sliderElectrodeOpacity = 1;       // mirrors the Electrodes slider value (ra
 const ELECTRODE_VIEW_DEFAULT_REGION_OPACITY = 0.5;
 let dandisetRegionFilter = null; // structure_id when filtering subjects by region within a dandiset
 let dandisetSubjectCounts = null; // { directSubjects, totalSubjects } when a dandiset is selected
+let previousRegionForDandiset = null; // structure_id the user came from before entering the current dandiset; powers the "Back to all Dandisets" button
 let hiddenRegionIds = new Set();  // regions toggled off by user in dandiset/subject view
 let dandisetsWithElectrodes = new Set();  // dandiset IDs that have electrode coordinate data
 const SESSION_ELECTRODE_COLORS = [
@@ -200,6 +201,7 @@ async function loadAtlas(atlasKey) {
   dandisetElectrodes = {};
   dandisetRegionFilter = null;
   dandisetSubjectCounts = null;
+  previousRegionForDandiset = null;
   hiddenRegionIds = new Set();
   idToStructure = {};
   dandisetToStructures = {};
@@ -1144,6 +1146,12 @@ function updateTreeBadges() {
 
 async function enterDandisetView(dandisetId, { pushState = true } = {}) {
   return transitionView('dandiset', async () => {
+    // Capture prior region (if any) so the dandiset panel can offer a back
+    // button. Excludes root (the init view) and null (deep-link entry — no
+    // prior region exists in this session).
+    const rootId = meshManifest ? meshManifest.root_id : null;
+    previousRegionForDandiset = (selectedId !== null && selectedId !== rootId) ? selectedId : null;
+
     selectedDandiset = dandisetId;
     selectedId = null;
     dandisetSubjectCounts = computeDandisetSubjectCounts(dandisetId);
@@ -1281,6 +1289,7 @@ function enterInitView() {
     selectedId = null;
     selectedDandiset = null;
     dandisetSubjectCounts = null;
+    previousRegionForDandiset = null;
     hiddenRegionIds = new Set();
 
     // Restore the Regions slider to full. Any prior auto-drop from an
@@ -1434,8 +1443,13 @@ async function updateDandisetPanel(dandisetId, structureIds) {
     const end = Math.min(start + PAGE_SIZE, subjects.length);
     const pageSubjects = subjects.slice(start, end);
 
+    const backButtonHtml = previousRegionForDandiset !== null
+      ? `<button class="dandiset-back-btn" id="dandiset-back-btn">&larr; Back to all Dandisets</button>`
+      : '';
+
     let html = `
       <div class="region-header">
+        ${backButtonHtml}
         <div class="region-name">Dandiset ${dandisetId}</div>
         <div class="dandiset-detail-title" id="dandiset-detail-title">${title}</div>
         <a class="dandiset-external-link" href="https://dandiarchive.org/dandiset/${dandisetId}" target="_blank" rel="noopener">
@@ -1590,6 +1604,14 @@ async function updateDandisetPanel(dandisetId, structureIds) {
 
     panel.innerHTML = html;
     attachCardListeners();
+
+    const backBtn = document.getElementById('dandiset-back-btn');
+    if (backBtn) {
+      backBtn.addEventListener('click', () => {
+        const targetRegion = previousRegionForDandiset;
+        if (targetRegion !== null) enterRegionView(targetRegion);
+      });
+    }
   }
 
   function attachCardListeners() {
@@ -2146,6 +2168,7 @@ function enterRegionView(structureId, { expandTree = true, pushState = true } = 
 
     selectedId = structureId;
     selectedDandiset = null;
+    previousRegionForDandiset = null;
     hiddenRegionIds = new Set();
     document.getElementById('region-visibility-overlay').classList.add('hidden');
     clearElectrodePoints();

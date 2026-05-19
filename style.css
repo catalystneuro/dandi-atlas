@@ -660,6 +660,28 @@ body {
   background: rgba(83, 168, 182, 0.3);
 }
 
+.dandiset-back-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 12px;
+  padding: 6px 12px;
+  background: transparent;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  color: var(--text-secondary);
+  font-size: 13px;
+  font-family: inherit;
+  cursor: pointer;
+  transition: color 0.15s, background 0.15s, border-color 0.15s;
+}
+
+.dandiset-back-btn:hover {
+  color: var(--accent-hover);
+  background: rgba(83, 168, 182, 0.15);
+  border-color: var(--accent);
+}
+
 /* Region cards (in dandiset view) */
 .region-card {
   display: flex;
