@@ -4,9 +4,19 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>3D Brain Atlas — DANDI Explorer</title>
-  <link rel="stylesheet" href="style.css?v=5">
+  <link rel="stylesheet" href="style.css?v=6">
 </head>
-<body>
+<body class="landing-active">
+  <!-- Atlas landing page: shown on bare load (no ?atlas= and no #hash).
+       Hidden once the user picks a card; deep-link loads skip it. -->
+  <section id="atlas-landing" class="atlas-landing">
+    <header class="atlas-landing-header">
+      <h1>DANDI Brain Atlas Explorer</h1>
+      <p>Pick an atlas to browse dandisets, subjects, and electrode locations in 3D.</p>
+    </header>
+    <div id="atlas-landing-grid" class="atlas-landing-grid"></div>
+  </section>
+
   <!-- Left sidebar: Hierarchy tree -->
   <aside id="sidebar-left" class="sidebar">
     <div class="sidebar-header">
@@ -90,6 +100,6 @@
     }
   }
   </script>
-  <script type="module" src="app.js?v=13"></script>
+  <script type="module" src="app.js?v=15"></script>
 </body>
 </html>

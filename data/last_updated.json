@@ -1,22 +1,22 @@
 {
-  "timestamp": "2026-05-12T04:20:49Z",
+  "timestamp": "2026-05-19T06:06:12.570974+00:00",
   "mode": "incremental",
   "dandisets_checked": 0,
   "dandisets_updated": 0,
   "assets_processed": 0,
   "per_atlas": {
     "d99": {
-      "timestamp": "2026-04-28T00:04:19.179108+00:00",
+      "timestamp": "2026-05-19T06:04:05.118920+00:00",
       "mode": "incremental",
       "asset_count": 447
     },
     "nmt": {
-      "timestamp": "2026-04-28T00:16:56.267343+00:00",
+      "timestamp": "2026-05-19T06:05:09.537245+00:00",
       "mode": "incremental",
       "asset_count": 447
     },
     "mebrains": {
-      "timestamp": "2026-04-28T00:16:15.085279+00:00",
+      "timestamp": "2026-05-19T06:06:12.570974+00:00",
       "mode": "incremental",
       "asset_count": 447
     }
