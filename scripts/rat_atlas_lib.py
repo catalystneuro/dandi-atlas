@@ -23,10 +23,13 @@ import remfile
 from tqdm import tqdm
 
 from dandi_helpers import (
+    RAT_TAXON_IDS,
     build_dandi_regions,
+    check_species_rat,
+    extract_session,
     get_download_url,
     get_nwb_assets_paged,
-    extract_session,
+    iter_all_dandisets,
 )
 from macaque_atlas_lib import (
     MIN_VOXELS,
@@ -504,6 +507,89 @@ def fetch_local_rat_data(local_dir, name_to_id, abbrev_to_id, id_to_structure, p
     return dandiset_assets, dandisets_with_electrodes, dandi_regions
 
 
+def _process_dandiset_assets(dandiset_id, assets, cache, cache_file,
+                             name_to_id, abbrev_to_id, id_to_structure,
+                             progress_position=None):
+    """Stream + cache + resolve locations for every NWB asset in one dandiset.
+
+    Shared between fetch_rat_dandi_data (explicit list) and
+    fetch_rat_dandi_sweep (DANDI-wide discovery). Returns the asset-record
+    list for this dandiset (matching the dandiset_assets[<id>] shape) plus
+    a skip count for the caller to log.
+    """
+    results = {}
+    to_process = []
+    for asset in assets:
+        asset_id = asset["asset_id"]
+        cache_key = (dandiset_id, asset_id)
+        if cache_key in cache:
+            results[asset_id] = cache[cache_key]
+        else:
+            to_process.append(asset)
+
+    def _process_one(asset):
+        asset_id = asset["asset_id"]
+        url = get_download_url(dandiset_id, asset_id)
+        try:
+            locations = _extract_rat_location_strings(url)
+            return {"dandiset_id": dandiset_id, "asset_id": asset_id, "locations": locations}
+        except Exception as exc:
+            tqdm.write(f"  Error processing {asset['path']}: {exc}")
+            return {"dandiset_id": dandiset_id, "asset_id": asset_id, "locations": [], "error": str(exc)}
+
+    if to_process:
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = {pool.submit(_process_one, a): a for a in to_process}
+            inner_bar = tqdm(
+                total=len(to_process),
+                desc=f"  {dandiset_id}",
+                unit="asset",
+                leave=False,
+                position=progress_position,
+            )
+            for future in as_completed(futures):
+                result = future.result()
+                results[result["asset_id"]] = result
+                _append_cache(cache_file, result)
+                inner_bar.update(1)
+            inner_bar.close()
+
+    records = []
+    skipped_no_loc = 0
+    for asset in assets:
+        asset_id = asset["asset_id"]
+        path = asset["path"]
+        result = results.get(asset_id, {})
+        locations = result.get("locations") or []
+        if not locations:
+            skipped_no_loc += 1
+            continue
+
+        regions = []
+        seen_ids = set()
+        unmatched = []
+        for loc in locations:
+            match = _resolve_location(loc, name_to_id, abbrev_to_id, id_to_structure)
+            if match is None:
+                if loc not in unmatched:
+                    unmatched.append(loc)
+                continue
+            if match["id"] in seen_ids:
+                continue
+            seen_ids.add(match["id"])
+            regions.append(match)
+
+        records.append({
+            "path": path,
+            "asset_id": asset_id,
+            "regions": regions,
+            "unmatched_locations": unmatched,
+            "session": extract_session(path),
+        })
+
+    return records, skipped_no_loc
+
+
 def fetch_rat_dandi_data(config, name_to_id, abbrev_to_id, id_to_structure, parent_map,
                          dandiset_ids=None):
     """Stream location data from each rat dandiset and aggregate.
@@ -528,81 +614,123 @@ def fetch_rat_dandi_data(config, name_to_id, abbrev_to_id, id_to_structure, pare
     print(f"  Cache has {len(cache)} entries")
 
     dandiset_assets = {}
-    for dandiset_id in dandiset_ids:
-        print(f"Fetching assets from dandiset {dandiset_id}...")
+    outer_bar = tqdm(dandiset_ids, desc="Explicit rat dandisets", unit="dandiset")
+    for dandiset_id in outer_bar:
+        outer_bar.set_postfix(dandiset=dandiset_id)
         assets = list(get_nwb_assets_paged(dandiset_id))
-        print(f"  Found {len(assets)} NWB assets")
-
-        results = {}
-        to_process = []
-        for asset in assets:
-            asset_id = asset["asset_id"]
-            cache_key = (dandiset_id, asset_id)
-            if cache_key in cache:
-                results[asset_id] = cache[cache_key]
-            else:
-                to_process.append(asset)
-        print(f"  Need to fetch {len(to_process)} new assets")
-
-        def _process_one(asset, _dandiset_id=dandiset_id):
-            asset_id = asset["asset_id"]
-            url = get_download_url(_dandiset_id, asset_id)
-            try:
-                locations = _extract_rat_location_strings(url)
-                return {"dandiset_id": _dandiset_id, "asset_id": asset_id, "locations": locations}
-            except Exception as exc:
-                print(f"  Error processing {asset['path']}: {exc}")
-                return {"dandiset_id": _dandiset_id, "asset_id": asset_id, "locations": [], "error": str(exc)}
-
-        if to_process:
-            with ThreadPoolExecutor(max_workers=4) as pool:
-                futures = {pool.submit(_process_one, a): a for a in to_process}
-                done = 0
-                for future in as_completed(futures):
-                    result = future.result()
-                    results[result["asset_id"]] = result
-                    _append_cache(cache_file, result)
-                    done += 1
-                    if done % 25 == 0:
-                        print(f"  Processed {done}/{len(to_process)} assets")
-
-        dandiset_assets[dandiset_id] = []
-        skipped_no_loc = 0
-        for asset in assets:
-            asset_id = asset["asset_id"]
-            path = asset["path"]
-            result = results.get(asset_id, {})
-            locations = result.get("locations") or []
-            if not locations:
-                skipped_no_loc += 1
-                continue
-
-            regions = []
-            seen_ids = set()
-            unmatched = []
-            for loc in locations:
-                match = _resolve_location(loc, name_to_id, abbrev_to_id, id_to_structure)
-                if match is None:
-                    if loc not in unmatched:
-                        unmatched.append(loc)
-                    continue
-                if match["id"] in seen_ids:
-                    continue
-                seen_ids.add(match["id"])
-                regions.append(match)
-
-            dandiset_assets[dandiset_id].append({
-                "path": path,
-                "asset_id": asset_id,
-                "regions": regions,
-                "unmatched_locations": unmatched,
-                "session": extract_session(path),
-            })
-
-        matched_count = len(dandiset_assets[dandiset_id])
-        print(f"  {dandiset_id}: {matched_count} assets with location data"
-              + (f" (skipped {skipped_no_loc} without locations)" if skipped_no_loc else ""))
+        records, skipped_no_loc = _process_dandiset_assets(
+            dandiset_id, assets, cache, cache_file,
+            name_to_id, abbrev_to_id, id_to_structure,
+        )
+        dandiset_assets[dandiset_id] = records
+        tqdm.write(
+            f"  {dandiset_id}: {len(assets)} assets, "
+            f"{len(records)} with location data"
+            + (f" (skipped {skipped_no_loc} without locations)" if skipped_no_loc else "")
+        )
+    outer_bar.close()
 
     dandisets_with_electrodes = []
     dandi_regions = build_dandi_regions(dandiset_assets, id_to_structure, parent_map)
     return dandiset_assets, dandisets_with_electrodes, dandi_regions
+
+
+def _is_rat_metadata(dandiset_metadata):
+    """Cheap species check using the metadata dict yielded by
+    iter_all_dandisets, falling back to a per-dandiset API call if the listing
+    payload doesn't include species inline.
+
+    Mirrors macaque_atlas_lib._is_macaque_metadata.
+    """
+    summary = (
+        (dandiset_metadata.get("most_recent_published_version") or {})
+        .get("metadata", {})
+        .get("assetsSummary", {})
+    )
+    species = summary.get("species") if isinstance(summary, dict) else None
+    if species:
+        for sp in species:
+            identifier = sp.get("identifier", "") or ""
+            name = sp.get("name", "") or ""
+            if any(tid in identifier for tid in RAT_TAXON_IDS):
+                return True
+            if "rattus" in name.lower():
+                return True
+        return False
+    dandiset_id = dandiset_metadata.get("identifier")
+    return bool(dandiset_id) and check_species_rat(dandiset_id)
+
+
+def fetch_rat_dandi_sweep(config, name_to_id, abbrev_to_id, id_to_structure, parent_map,
+                          exclude_ids=(), limit=None):
+    """Discover all public rat dandisets via iter_all_dandisets() and return
+    per-asset region records resolved against the WHS-SD vocabulary.
+
+    Streams only `general/extracellular_ephys/electrodes/location` per asset
+    via `_extract_rat_location_strings` — no full-NWB downloads. Results are
+    cached per (dandiset_id, asset_id) in `config["cache_file"]`, the same
+    cache used by `fetch_rat_dandi_data`.
+
+    Pre-filtering uses the inline `assetsSummary.species` metadata from the
+    DANDI listing (via _is_rat_metadata), so the discovery pass costs ~one
+    paginated API call total. Dandisets in `exclude_ids` (typically the
+    explicit DANDISET_IDS the caller already handled) are skipped.
+
+    When `limit` is set, the discovery scan short-circuits as soon as `limit`
+    rat dandisets have been found, and only those are streamed. Useful for
+    smoke tests before committing to a full multi-hour sweep.
+
+    Returns {dandiset_id: [asset_record, ...]} in the same shape as
+    fetch_rat_dandi_data[0], suitable for `dict.update()` merging.
+    """
+    exclude_ids = set(exclude_ids)
+    cache_file = config["cache_file"]
+    cache = _load_cache(cache_file)
+    print(f"  Cache has {len(cache)} entries")
+
+    rat_dandiset_ids = []
+    scan_bar = tqdm(iter_all_dandisets(), desc="Scanning DANDI", unit="dandiset")
+    for dandiset_metadata in scan_bar:
+        dandiset_id = dandiset_metadata.get("identifier")
+        if not dandiset_id or dandiset_id in exclude_ids:
+            continue
+        if _is_rat_metadata(dandiset_metadata):
+            rat_dandiset_ids.append(dandiset_id)
+            scan_bar.set_postfix(rat_found=len(rat_dandiset_ids))
+            if limit is not None and len(rat_dandiset_ids) >= limit:
+                break
+    scan_bar.close()
+    if limit is not None:
+        print(f"  [rat-sweep] discovered {len(rat_dandiset_ids)} rat dandisets "
+              f"(stopped early; --sweep-limit={limit})")
+    else:
+        print(f"  [rat-sweep] discovered {len(rat_dandiset_ids)} candidate rat dandisets")
+
+    out = {}
+    outer_bar = tqdm(rat_dandiset_ids, desc="Rat sweep", unit="dandiset")
+    for dandiset_id in outer_bar:
+        outer_bar.set_postfix(dandiset=dandiset_id)
+        try:
+            assets = list(get_nwb_assets_paged(dandiset_id))
+        except Exception as exc:
+            tqdm.write(f"  [rat-sweep] failed to list {dandiset_id}: {exc}")
+            continue
+        if not assets:
+            continue
+        records, skipped_no_loc = _process_dandiset_assets(
+            dandiset_id, assets, cache, cache_file,
+            name_to_id, abbrev_to_id, id_to_structure,
+        )
+        if not records:
+            continue
+        if not any(record["regions"] for record in records):
+            continue
+        out[dandiset_id] = records
+        tqdm.write(
+            f"  [rat-sweep] {dandiset_id}: {len(assets)} assets, "
+            f"{len(records)} with location data"
+            + (f" (skipped {skipped_no_loc} without locations)" if skipped_no_loc else "")
+        )
+    outer_bar.close()
+
+    return out

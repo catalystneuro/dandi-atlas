@@ -37,6 +37,7 @@ from rat_atlas_lib import (
     EMBARGOED_DANDISETS,
     fetch_local_rat_data,
     fetch_rat_dandi_data,
+    fetch_rat_dandi_sweep,
     generate_meshes_with_progress,
     parse_whs_ilf,
 )
@@ -68,6 +69,20 @@ def main():
     )
     parser.add_argument("--skip-meshes", action="store_true", help="Skip mesh generation")
     parser.add_argument("--skip-dandi", action="store_true", help="Skip DANDI data extraction")
+    parser.add_argument(
+        "--skip-sweep",
+        action="store_true",
+        help="Skip the DANDI-wide rat sweep; only process the explicit "
+             "DANDISET_IDS list.",
+    )
+    parser.add_argument(
+        "--sweep-limit",
+        type=int,
+        default=None,
+        help="Stop the sweep after discovering this many rat dandisets. "
+             "Useful for smoke-testing the streaming pass on a handful of "
+             "dandisets before running the full sweep.",
+    )
     parser.add_argument(
         "--local-nwb",
         type=Path,
@@ -147,11 +162,23 @@ def main():
             stream_assets = {}
         dandiset_assets = {**local_assets, **stream_assets}
         dandisets_with_electrodes = []
-        dandi_regions = build_dandi_regions(dandiset_assets, id_to_structure, parent_map)
     else:
-        dandiset_assets, dandisets_with_electrodes, dandi_regions = fetch_rat_dandi_data(
+        dandiset_assets, dandisets_with_electrodes, _ = fetch_rat_dandi_data(
             config, name_to_id, abbrev_to_id, id_to_structure, parent_map,
         )
+
+    if not args.skip_dandi and not args.skip_sweep:
+        print("Sweeping DANDI for additional rat dandisets...")
+        sweep_assets = fetch_rat_dandi_sweep(
+            config, name_to_id, abbrev_to_id, id_to_structure, parent_map,
+            exclude_ids=set(dandiset_assets),
+            limit=args.sweep_limit,
+        )
+        dandiset_assets.update(sweep_assets)
+        print(f"  Sweep added {len(sweep_assets)} new dandiset(s)")
+
+    if not args.skip_dandi:
+        dandi_regions = build_dandi_regions(dandiset_assets, id_to_structure, parent_map)
 
     with open(data_dir / "dandiset_assets.json", "w") as f:
         json.dump(dandiset_assets, f)

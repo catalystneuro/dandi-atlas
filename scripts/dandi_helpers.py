@@ -138,6 +138,33 @@ def check_species_macaque(dandiset_id):
     return False
 
 
+# NCBI taxonomy IDs for rat species seen in DANDI. Rattus norvegicus dominates
+# (lab rat); Rattus rattus is included for completeness. Add more here if a
+# future dandiset uses a different Rattus species.
+RAT_TAXON_IDS = {
+    "10116",  # Rattus norvegicus (Norway / lab rat)
+    "10117",  # Rattus rattus (black rat)
+}
+
+
+def check_species_rat(dandiset_id):
+    """Check if a dandiset's assetsSummary.species includes any Rattus species.
+
+    Matches on either an NCBI taxon identifier in RAT_TAXON_IDS or a substring
+    "rattus" in the species `name` field. The name match is intentionally
+    "rattus" (genus) rather than the bare word "rat" to avoid false positives
+    on species like "naked mole-rat" (Heterocephalus glaber).
+    """
+    for sp in get_dandiset_species(dandiset_id):
+        identifier = sp.get("identifier", "") or ""
+        name = sp.get("name", "") or ""
+        if any(tid in identifier for tid in RAT_TAXON_IDS):
+            return True
+        if "rattus" in name.lower():
+            return True
+    return False
+
+
 def get_nwb_assets_paged(dandiset_id, version="draft", max_assets=None):
     """Yield NWB asset dicts for a dandiset, with pagination."""
     url = (
