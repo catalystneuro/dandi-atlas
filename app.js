@@ -3037,7 +3037,8 @@ document.getElementById('region-opacity').addEventListener('input', (e) => {
   // discussion. Revisit if we adopt order-independent transparency or a
   // hierarchy-aware renderOrder scheme.
   for (const mesh of Object.values(meshObjects)) {
-    if (mesh.userData.displayMode === 'hidden' || mesh.userData.displayMode === 'silhouette') continue;
+    const mode = mesh.userData.displayMode;
+    if (mode === 'hidden' || mode === 'silhouette') continue;
     if (sliderRegionOpacity === 0) {
       mesh.visible = false;
       continue;
@@ -3045,8 +3046,16 @@ document.getElementById('region-opacity').addEventListener('input', (e) => {
     mesh.visible = true;
     const orig = mesh.userData.originalMaterial;
     if (!orig) continue;
-    mesh.material.opacity = orig.opacity * sliderRegionOpacity;
-    mesh.material.transparent = mesh.material.opacity < 1;
+    // Match the per-mode opacity formulas in applyDisplayMode. Using a
+    // single 'orig.opacity * slider' formula for all modes leaks the
+    // material's intrinsic translucency into the active/roi modes, which
+    // caps the effective opacity below 1 even when the slider reads 1.
+    let opacity;
+    if (mode === 'active') opacity = sliderRegionOpacity;
+    else if (mode === 'roi') opacity = sliderRegionOpacity * 0.35;
+    else opacity = orig.opacity * sliderRegionOpacity;  // 'glass'
+    mesh.material.opacity = opacity;
+    mesh.material.transparent = opacity < 1;
     mesh.material.needsUpdate = true;
   }
 });
