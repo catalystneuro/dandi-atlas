@@ -36,6 +36,10 @@ TRIVIAL_LOCATIONS = {
     # "Skull" / "ground" / "reference" are not brain regions; they describe
     # where a reference wire was screwed in, not what was recorded from.
     "skull", "ground", "gnd", "reference", "ref",
+    # Recording-condition descriptors (000408, 000529 — in vitro patch-clamp
+    # rigs put the buffer composition in the `location` field).
+    "in vitro", "invitro",
+    "in vitro. phosphate buffered saline solution with ar sparging at 37c",
 }
 
 FILTER_IDS = {997, 8}  # root, grey — not useful to display

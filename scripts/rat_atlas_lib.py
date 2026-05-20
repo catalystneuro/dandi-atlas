@@ -84,10 +84,33 @@ WHS_LOCATION_ALIASES = {
     # collapse to the parent Caudate putamen. VS maps to the closest single
     # WHS-SD region for ventral striatum (NAc is the discrete core+shell;
     # VSR-u is the broader ventral striatal sheet that better matches
-    # microwire-bundle "ventral striatum" placements).
+    # microwire-bundle "ventral striatum" placements). CS is not mentioned in
+    # the paper and intentionally left unmatched — see issue/PR history.
     "dls": "Caudate putamen",
     "dms": "Caudate putamen",
     "vs": "Ventral striatal region, unspecified",
+    # 000213, 000218 (Petersen-style lowercase ephys abbreviations).
+    "ls": "Septal region",          # lateral septum → WHS-SD has flat Sep
+    "ms": "Septal region",          # medial septum → same flat parent
+    "hpc": "Hippocampal formation",
+    "ca3": "Cornu ammonis 3",       # resolver abbrev table is case-sensitive
+    "acg": "Cingulate cortex",      # anterior cingulate → Cg parent
+    "cc": "corpus callosum and associated subcortical white matter",
+    "sfi": "fimbria of the hippocampus",  # septofimbrial → closest WHS-SD parcel
+    # 000398: explicit barrel-cortex string (hemisphere strip turns
+    # "Left barrel cortex" into "barrel cortex" before this alias check).
+    "barrel cortex": "Primary somatosensory area, barrel field",
+    # 000447, 000978, 001539: generic "PFC" without medial/orbital qualifier.
+    # Use the parent "Frontal region" since we can't disambiguate MFC vs Orb.
+    "pfc": "Frontal region",
+    # 001250: S1HL with cortical-layer or out-of-cortex qualifier. WHS-SD has
+    # no per-layer subdivision, so every layer collapses to the hindlimb parcel.
+    "s1hl, l1": "Primary somatosensory area, hindlimb representation",
+    "s1hl, l2/3": "Primary somatosensory area, hindlimb representation",
+    "s1hl, l4": "Primary somatosensory area, hindlimb representation",
+    "s1hl, l5": "Primary somatosensory area, hindlimb representation",
+    "s1hl, l6": "Primary somatosensory area, hindlimb representation",
+    "s1hl, outside of the cortex": "Primary somatosensory area, hindlimb representation",
 }
 
 ATLAS_CONFIGS = {
