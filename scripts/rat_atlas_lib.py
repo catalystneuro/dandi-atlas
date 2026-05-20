@@ -67,6 +67,19 @@ WHS_DATA = Path(os.environ.get("WHS_SD_DATA", DEFAULT_WHS_DATA))
 DANDISET_IDS = ["001699", "001754"]
 EMBARGOED_DANDISETS = {"001699"}
 
+# Schema version for per-asset and sweep cache entries. Bump when the set of
+# NWB groups read by _extract_locations_from_nwb changes — cached entries from
+# older versions only carry strings from a narrower set of sources, so loading
+# them would silently skip dandisets whose anatomical labels live outside that
+# narrower set (e.g. optophysiology planes, NDX anatomical localization).
+# Entries below this version are treated as cache misses and re-streamed.
+#
+# v2: also reads optophysiology/<plane>/location,
+#     intracellular_ephys/<electrode>/location, and the NDX anatomical
+#     localization extension (general/localization/<group>/brain_region[_id]).
+# v1 (legacy, no field): only general/extracellular_ephys/electrodes/location.
+LOCATION_SCHEMA_VERSION = 2
+
 # Alias map for free-text NWB location strings whose canonical WHS-SD region
 # name differs from the upstream label. Keys are normalized via
 # _normalize_region_name (lowercased, underscores → spaces). Values are
@@ -440,38 +453,83 @@ def _resolve_location(location_string, name_to_id, abbrev_to_id, id_to_structure
     return None
 
 
-def _extract_rat_location_strings(url):
-    """Read electrode location strings from a rat NWB file via HTTP streaming.
+def _extract_locations_from_nwb(nwb_file):
+    """Collect deduplicated anatomical-location strings from every standard
+    NWB place a rat dandiset might annotate them.
 
-    DANDI 001699 stores per-electrode anatomical locations in
-    `general/extracellular_ephys/electrodes/location` as free-text strings
-    (e.g. "left postsubiculum"). Returns a deduplicated list.
+    Mirrors macaque_atlas_lib.extract_macaque_location_strings so the rat path
+    sees the same set of fields:
+
+      Free-text labels:
+        - general/extracellular_ephys/electrodes/location
+        - general/optophysiology/<plane>/location
+        - general/intracellular_ephys/<electrode>/location
+
+      NDX anatomical localization extension (AnatomicalCoordinatesTable):
+        - general/localization/<group>/brain_region
+        - general/localization/<group>/brain_region_id
+
+    Returns a deduplicated list of non-empty strings. Caller resolves each
+    candidate against the WHS-SD vocabulary; unresolvable strings are reported
+    via the per-asset `unmatched_locations` field rather than dropped silently.
+
+    Takes an already-opened h5py.File so the streaming (`remfile`) and local
+    (`open()`) callers can share the traversal.
     """
     seen = set()
     out = []
-    rf = remfile.File(url)
-    with h5py.File(rf, "r") as f:
-        if "general/extracellular_ephys/electrodes" not in f:
-            return out
-        electrodes = f["general/extracellular_ephys/electrodes"]
-        if "location" not in electrodes:
-            return out
-        raw = electrodes["location"][()]
+
+    def _push(value):
+        if isinstance(value, bytes):
+            value = value.decode("utf-8", errors="replace")
+        text = str(value).strip()
+        if not text or text in seen:
+            return
+        seen.add(text)
+        out.append(text)
+
+    def _push_iterable(raw):
         if hasattr(raw, "__iter__") and not isinstance(raw, (str, bytes)):
             for value in raw:
-                if isinstance(value, bytes):
-                    value = value.decode("utf-8", errors="replace")
-                value = str(value).strip()
-                if value and value not in seen:
-                    seen.add(value)
-                    out.append(value)
+                _push(value)
         else:
-            if isinstance(raw, bytes):
-                raw = raw.decode("utf-8", errors="replace")
-            value = str(raw).strip()
-            if value:
-                out.append(value)
+            _push(raw)
+
+    if "general/extracellular_ephys/electrodes" in nwb_file:
+        electrodes = nwb_file["general/extracellular_ephys/electrodes"]
+        if "location" in electrodes:
+            _push_iterable(electrodes["location"][()])
+    if "general/optophysiology" in nwb_file:
+        for name in nwb_file["general/optophysiology"]:
+            plane = nwb_file[f"general/optophysiology/{name}"]
+            if isinstance(plane, h5py.Group) and "location" in plane:
+                _push(plane["location"][()])
+    if "general/intracellular_ephys" in nwb_file:
+        for name in nwb_file["general/intracellular_ephys"]:
+            item = nwb_file[f"general/intracellular_ephys/{name}"]
+            if isinstance(item, h5py.Group) and "location" in item:
+                _push(item["location"][()])
+    if "general/localization" in nwb_file:
+        localization = nwb_file["general/localization"]
+        for name in localization:
+            sub = localization[name]
+            if not isinstance(sub, h5py.Group):
+                continue
+            for column in ("brain_region", "brain_region_id"):
+                if column in sub:
+                    _push_iterable(sub[column][()])
+
     return out
+
+
+def _extract_rat_location_strings(url):
+    """Read anatomical-location strings from a rat NWB file via HTTP streaming.
+
+    Thin wrapper around _extract_locations_from_nwb that opens the remote NWB.
+    """
+    rf = remfile.File(url)
+    with h5py.File(rf, "r") as f:
+        return _extract_locations_from_nwb(f)
 
 
 def _load_cache(cache_file):
@@ -479,12 +537,21 @@ def _load_cache(cache_file):
 
     Legacy entries without a `dandiset_id` field are from the single-dandiset
     era and are assumed to belong to 001699.
+
+    Entries whose `schema_version` is below LOCATION_SCHEMA_VERSION are skipped
+    so the asset gets re-streamed with the wider extractor. Without this gate,
+    a dandiset whose only anatomical labels live on optophysiology planes,
+    intracellular electrodes, or the NDX anatomical localization extension
+    would stay flagged as "no usable locations" forever just because its
+    earlier cache entry was written before those sources were read.
     """
     cache = {}
     if cache_file.exists():
         with open(cache_file, "r") as f:
             for line in f:
                 entry = json.loads(line)
+                if entry.get("schema_version", 1) < LOCATION_SCHEMA_VERSION:
+                    continue
                 dandiset_id = entry.get("dandiset_id", "001699")
                 cache[(dandiset_id, entry["asset_id"])] = entry
     return cache
@@ -502,12 +569,23 @@ def _load_sweep_cache(sweep_cache_file):
     invalidates the entry when the dandiset is updated on DANDI — newer
     listings show a fresh modified value and miss the cache, triggering a
     re-evaluation.
+
+    `no_workable` verdicts below LOCATION_SCHEMA_VERSION are dropped: they were
+    decided against a narrower extractor and the dandiset may now turn up
+    workable strings from the additional NWB groups the new version reads.
+    `not_rat` and `oversized` verdicts depend only on species metadata and
+    asset count, so they remain valid regardless of schema version.
     """
     cache = {}
     if sweep_cache_file.exists():
         with open(sweep_cache_file, "r") as f:
             for line in f:
                 entry = json.loads(line)
+                if (
+                    entry.get("verdict") == "no_workable"
+                    and entry.get("schema_version", 1) < LOCATION_SCHEMA_VERSION
+                ):
+                    continue
                 key = (entry["dandiset_id"], entry["modified"])
                 cache[key] = entry
     return cache
@@ -542,28 +620,14 @@ def _select_local_nwb_files(local_dir):
 
 
 def _extract_local_location_strings(file_path):
-    """Read electrode location strings from a local NWB file (no streaming)."""
-    seen = set()
-    out = []
+    """Read anatomical-location strings from a local NWB file (no streaming).
+
+    Same field coverage as _extract_rat_location_strings; used for the
+    embargoed Dudchenko-lab path that reads files off disk instead of via
+    DANDI's HTTP API.
+    """
     with h5py.File(str(file_path), "r") as f:
-        if "general/extracellular_ephys/electrodes" not in f:
-            return out
-        electrodes = f["general/extracellular_ephys/electrodes"]
-        if "location" not in electrodes:
-            return out
-        raw = electrodes["location"][()]
-        if hasattr(raw, "__iter__") and not isinstance(raw, (str, bytes)):
-            iterable = raw
-        else:
-            iterable = [raw]
-        for value in iterable:
-            if isinstance(value, bytes):
-                value = value.decode("utf-8", errors="replace")
-            value = str(value).strip()
-            if value and value not in seen:
-                seen.add(value)
-                out.append(value)
-    return out
+        return _extract_locations_from_nwb(f)
 
 
 def fetch_local_rat_data(local_dir, name_to_id, abbrev_to_id, id_to_structure, parent_map,
@@ -653,10 +717,21 @@ def _process_dandiset_assets(dandiset_id, assets, cache, cache_file,
         url = get_download_url(dandiset_id, asset_id)
         try:
             locations = _extract_rat_location_strings(url)
-            return {"dandiset_id": dandiset_id, "asset_id": asset_id, "locations": locations}
+            return {
+                "schema_version": LOCATION_SCHEMA_VERSION,
+                "dandiset_id": dandiset_id,
+                "asset_id": asset_id,
+                "locations": locations,
+            }
         except Exception as exc:
             tqdm.write(f"  Error processing {asset['path']}: {exc}")
-            return {"dandiset_id": dandiset_id, "asset_id": asset_id, "locations": [], "error": str(exc)}
+            return {
+                "schema_version": LOCATION_SCHEMA_VERSION,
+                "dandiset_id": dandiset_id,
+                "asset_id": asset_id,
+                "locations": [],
+                "error": str(exc),
+            }
 
     if to_process:
         with ThreadPoolExecutor(max_workers=4) as pool:
@@ -844,6 +919,7 @@ def fetch_rat_dandi_sweep(config, name_to_id, abbrev_to_id, id_to_structure, par
             continue
         if not _is_rat_metadata(dandiset_metadata):
             _append_sweep_cache(sweep_cache_file, {
+                "schema_version": LOCATION_SCHEMA_VERSION,
                 "dandiset_id": dandiset_id, "modified": modified,
                 "verdict": "not_rat",
             })
@@ -855,6 +931,7 @@ def fetch_rat_dandi_sweep(config, name_to_id, abbrev_to_id, id_to_structure, par
             continue
         if not assets:
             _append_sweep_cache(sweep_cache_file, {
+                "schema_version": LOCATION_SCHEMA_VERSION,
                 "dandiset_id": dandiset_id, "modified": modified,
                 "verdict": "no_workable", "asset_count": 0,
             })
@@ -865,6 +942,7 @@ def fetch_rat_dandi_sweep(config, name_to_id, abbrev_to_id, id_to_structure, par
                 f"max {max_assets_per_dandiset}); raise --sweep-max-assets to include."
             )
             _append_sweep_cache(sweep_cache_file, {
+                "schema_version": LOCATION_SCHEMA_VERSION,
                 "dandiset_id": dandiset_id, "modified": modified,
                 "verdict": "oversized", "asset_count": len(assets),
             })
@@ -881,12 +959,14 @@ def fetch_rat_dandi_sweep(config, name_to_id, abbrev_to_id, id_to_structure, par
                 f"no usable location strings (all blank/None/unknown) — not workable"
             )
             _append_sweep_cache(sweep_cache_file, {
+                "schema_version": LOCATION_SCHEMA_VERSION,
                 "dandiset_id": dandiset_id, "modified": modified,
                 "verdict": "no_workable", "asset_count": len(assets),
             })
             continue
         processed += 1
         _append_sweep_cache(sweep_cache_file, {
+            "schema_version": LOCATION_SCHEMA_VERSION,
             "dandiset_id": dandiset_id, "modified": modified,
             "verdict": "workable", "asset_count": len(assets),
         })
