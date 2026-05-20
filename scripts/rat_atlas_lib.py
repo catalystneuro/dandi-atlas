@@ -13,6 +13,7 @@ Run `scripts/build_rat_atlas.py` to invoke the pipeline.
 
 import json
 import os
+import re
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -111,6 +112,22 @@ WHS_LOCATION_ALIASES = {
     "s1hl, l5": "Primary somatosensory area, hindlimb representation",
     "s1hl, l6": "Primary somatosensory area, hindlimb representation",
     "s1hl, outside of the cortex": "Primary somatosensory area, hindlimb representation",
+}
+
+# Curated overrides for the WHS-SD → UBERON mapping. Keyed by WHS-SD region
+# **id** (not name). Values are either:
+#   {"id": "UBERON:NNNNNNN", "label": "<canonical UBERON label>"}  to pin a
+#       mapping when the OLS4 search picks the wrong candidate, or
+#   None  to mark a region as intentionally unmapped (synthetic root, outside-
+#       atlas sentinel, atlas-specific group nodes with no UBERON analogue).
+#
+# `scripts/build_whs_uberon_mapping.py` applies this dict on top of OLS4 search
+# results, so the committed `data/atlases/whs_sd/uberon_mapping.json` reflects
+# whatever lives here. Add an entry whenever the generator's fuzzy/unmapped
+# report flags a row that needs hand-curation.
+WHS_UBERON_OVERRIDES = {
+    # ROOT_ID and OUTSIDE_ID are synthetic sentinels with no UBERON analogue;
+    # the generator already skips them, so no explicit override is needed here.
 }
 
 ATLAS_CONFIGS = {
@@ -344,7 +361,14 @@ def generate_meshes_with_progress(nifti_file, meshes_dir, id_to_structure, templ
     return sorted(set(no_mesh))
 
 
-def _resolve_location(location_string, name_to_id, abbrev_to_id, id_to_structure):
+_UBERON_CURIE_RE = re.compile(r"^UBERON:\d+$", re.IGNORECASE)
+_UBERON_IRI_RE = re.compile(
+    r"^https?://purl\.obolibrary\.org/obo/UBERON_(\d+)$", re.IGNORECASE
+)
+
+
+def _resolve_location(location_string, name_to_id, abbrev_to_id, id_to_structure,
+                      uberon_label_to_whs_id, uberon_id_to_whs_id):
     """Match a free-text NWB location string against the WHS-SD vocabulary.
 
     Strategy:
@@ -353,6 +377,10 @@ def _resolve_location(location_string, name_to_id, abbrev_to_id, id_to_structure
          not "left postsubiculum"). NWB convention is to prefix the hemisphere.
       2. Try full-name match (normalized) against name_to_id.
       3. Try abbreviation match against abbrev_to_id.
+      4. Try WHS_LOCATION_ALIASES (hand-curated free-text → canonical name).
+      5. Try UBERON CURIE / IRI (e.g. "UBERON:0001874") and UBERON label
+         (e.g. "caudate-putamen") against the UBERON reverse-lookup tables
+         built from data/atlases/whs_sd/uberon_mapping.json.
 
     Returns matched structure dict or None.
     """
@@ -386,6 +414,29 @@ def _resolve_location(location_string, name_to_id, abbrev_to_id, id_to_structure
                 sid = name_to_id[target_norm]
                 s = id_to_structure[sid]
                 return {"id": sid, "acronym": s["acronym"], "name": s["name"]}
+
+    # UBERON CURIE / IRI: normalize to "UBERON:NNNNNNN" and look up directly.
+    curie = None
+    if _UBERON_CURIE_RE.match(raw):
+        curie = raw.upper()
+    else:
+        iri_match = _UBERON_IRI_RE.match(raw)
+        if iri_match:
+            curie = f"UBERON:{iri_match.group(1)}"
+    if curie and curie in uberon_id_to_whs_id:
+        sid = uberon_id_to_whs_id[curie]
+        s = id_to_structure[sid]
+        return {"id": sid, "acronym": s["acronym"], "name": s["name"]}
+
+    # UBERON label: e.g. "caudate-putamen" where the WHS-SD canonical name
+    # uses different punctuation/word order and the name table missed it.
+    for cand in candidates:
+        norm = _normalize_region_name(cand)
+        if norm and norm in uberon_label_to_whs_id:
+            sid = uberon_label_to_whs_id[norm]
+            s = id_to_structure[sid]
+            return {"id": sid, "acronym": s["acronym"], "name": s["name"]}
+
     return None
 
 
@@ -516,6 +567,7 @@ def _extract_local_location_strings(file_path):
 
 
 def fetch_local_rat_data(local_dir, name_to_id, abbrev_to_id, id_to_structure, parent_map,
+                        uberon_label_to_whs_id, uberon_id_to_whs_id,
                         dandiset_id="001699"):
     """Build dandiset_assets/regions from local NWB files instead of DANDI.
 
@@ -548,7 +600,10 @@ def fetch_local_rat_data(local_dir, name_to_id, abbrev_to_id, id_to_structure, p
         seen_ids = set()
         unmatched = []
         for loc in locations:
-            match = _resolve_location(loc, name_to_id, abbrev_to_id, id_to_structure)
+            match = _resolve_location(
+                loc, name_to_id, abbrev_to_id, id_to_structure,
+                uberon_label_to_whs_id, uberon_id_to_whs_id,
+            )
             if match is None:
                 if loc not in unmatched:
                     unmatched.append(loc)
@@ -574,6 +629,7 @@ def fetch_local_rat_data(local_dir, name_to_id, abbrev_to_id, id_to_structure, p
 
 def _process_dandiset_assets(dandiset_id, assets, cache, cache_file,
                              name_to_id, abbrev_to_id, id_to_structure,
+                             uberon_label_to_whs_id, uberon_id_to_whs_id,
                              progress_position=None):
     """Stream + cache + resolve locations for every NWB asset in one dandiset.
 
@@ -637,7 +693,10 @@ def _process_dandiset_assets(dandiset_id, assets, cache, cache_file,
         seen_ids = set()
         unmatched = []
         for loc in locations:
-            match = _resolve_location(loc, name_to_id, abbrev_to_id, id_to_structure)
+            match = _resolve_location(
+                loc, name_to_id, abbrev_to_id, id_to_structure,
+                uberon_label_to_whs_id, uberon_id_to_whs_id,
+            )
             if match is None:
                 if loc not in unmatched:
                     unmatched.append(loc)
@@ -659,6 +718,7 @@ def _process_dandiset_assets(dandiset_id, assets, cache, cache_file,
 
 
 def fetch_rat_dandi_data(config, name_to_id, abbrev_to_id, id_to_structure, parent_map,
+                         uberon_label_to_whs_id, uberon_id_to_whs_id,
                          dandiset_ids=None):
     """Stream location data from each rat dandiset and aggregate.
 
@@ -689,6 +749,7 @@ def fetch_rat_dandi_data(config, name_to_id, abbrev_to_id, id_to_structure, pare
         records, skipped_no_loc, _ = _process_dandiset_assets(
             dandiset_id, assets, cache, cache_file,
             name_to_id, abbrev_to_id, id_to_structure,
+            uberon_label_to_whs_id, uberon_id_to_whs_id,
         )
         dandiset_assets[dandiset_id] = records
         tqdm.write(
@@ -730,6 +791,7 @@ def _is_rat_metadata(dandiset_metadata):
 
 
 def fetch_rat_dandi_sweep(config, name_to_id, abbrev_to_id, id_to_structure, parent_map,
+                          uberon_label_to_whs_id, uberon_id_to_whs_id,
                           exclude_ids=(), limit=None, max_assets_per_dandiset=1000):
     """Discover all public rat dandisets via iter_all_dandisets() and return
     per-asset region records resolved against the WHS-SD vocabulary.
@@ -811,6 +873,7 @@ def fetch_rat_dandi_sweep(config, name_to_id, abbrev_to_id, id_to_structure, par
         records, _, has_workable_locations = _process_dandiset_assets(
             dandiset_id, assets, cache, cache_file,
             name_to_id, abbrev_to_id, id_to_structure,
+            uberon_label_to_whs_id, uberon_id_to_whs_id,
         )
         if not has_workable_locations:
             tqdm.write(

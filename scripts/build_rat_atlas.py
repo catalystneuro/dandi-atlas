@@ -29,7 +29,7 @@ import sys
 from pathlib import Path
 
 from dandi_helpers import build_dandi_regions, get_ancestors
-from macaque_atlas_lib import OUTSIDE_ID, ROOT_ID
+from macaque_atlas_lib import OUTSIDE_ID, ROOT_ID, _normalize_region_name
 import rat_atlas_lib
 from rat_atlas_lib import (
     ATLAS_CONFIGS,
@@ -41,6 +41,35 @@ from rat_atlas_lib import (
     generate_meshes_with_progress,
     parse_whs_ilf,
 )
+
+
+def _load_uberon_lookups(data_dir):
+    """Build reverse lookups from data/atlases/whs_sd/uberon_mapping.json.
+
+    Returns (uberon_label_to_whs_id, uberon_id_to_whs_id). Both are empty
+    when the mapping file is absent — the resolver then behaves as it did
+    before the UBERON layer existed.
+    """
+    mapping_path = data_dir / "uberon_mapping.json"
+    if not mapping_path.exists():
+        print(f"  No UBERON mapping at {mapping_path}; resolver will skip UBERON step")
+        return {}, {}
+    with open(mapping_path) as f:
+        mapping = json.load(f)
+    label_to_id = {}
+    curie_to_id = {}
+    for row in mapping.values():
+        whs_id = row["whs_id"]
+        curie = row.get("uberon_id")
+        label = row.get("uberon_label")
+        if curie:
+            curie_to_id[curie.upper()] = whs_id
+        if label:
+            normalized = _normalize_region_name(label)
+            if normalized:
+                label_to_id[normalized] = whs_id
+    print(f"  Loaded UBERON mapping: {len(curie_to_id)} CURIEs, {len(label_to_id)} labels")
+    return label_to_id, curie_to_id
 
 
 def _validate_inputs(config):
@@ -121,6 +150,7 @@ def main():
     )
     print(f"  Parsed {len(id_to_structure)} structures from ILF "
           f"(including ROOT and OUTSIDE sentinels)")
+    uberon_label_to_whs_id, uberon_id_to_whs_id = _load_uberon_lookups(data_dir)
     with open(data_dir / "structure_graph.json", "w") as f:
         json.dump(tree, f)
     print("  Wrote structure_graph.json")
@@ -161,11 +191,13 @@ def main():
         # then stream every non-embargoed entry in DANDISET_IDS from DANDI.
         local_assets, _, _ = fetch_local_rat_data(
             args.local_nwb, name_to_id, abbrev_to_id, id_to_structure, parent_map,
+            uberon_label_to_whs_id, uberon_id_to_whs_id,
         )
         streaming_ids = [d for d in DANDISET_IDS if d not in EMBARGOED_DANDISETS]
         if streaming_ids:
             stream_assets, _, _ = fetch_rat_dandi_data(
                 config, name_to_id, abbrev_to_id, id_to_structure, parent_map,
+                uberon_label_to_whs_id, uberon_id_to_whs_id,
                 dandiset_ids=streaming_ids,
             )
         else:
@@ -175,12 +207,14 @@ def main():
     else:
         dandiset_assets, dandisets_with_electrodes, _ = fetch_rat_dandi_data(
             config, name_to_id, abbrev_to_id, id_to_structure, parent_map,
+            uberon_label_to_whs_id, uberon_id_to_whs_id,
         )
 
     if not args.skip_dandi and not args.skip_sweep:
         print("Sweeping DANDI for additional rat dandisets...")
         sweep_assets = fetch_rat_dandi_sweep(
             config, name_to_id, abbrev_to_id, id_to_structure, parent_map,
+            uberon_label_to_whs_id, uberon_id_to_whs_id,
             exclude_ids=set(dandiset_assets),
             limit=args.sweep_limit,
             max_assets_per_dandiset=args.sweep_max_assets if args.sweep_max_assets > 0 else None,
