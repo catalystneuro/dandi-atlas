@@ -43,6 +43,8 @@ jobs:
             scripts/d99_electrode_cache.jsonl
             scripts/nmt_electrode_cache.jsonl
             scripts/mebrains_electrode_cache.jsonl
+            scripts/whs_sd_electrode_cache.jsonl
+            scripts/whs_sd_sweep_cache.jsonl
           key: data-cache-${{ github.run_id }}
           restore-keys: data-cache-
 
@@ -72,6 +74,11 @@ jobs:
 
       - name: Update macaque atlas data (MEBRAINS)
         run: python scripts/update_macaque_data.py --atlas mebrains --mode ${{ steps.mode.outputs.mode }}
+        env:
+          PYTHONUNBUFFERED: "1"
+
+      - name: Update rat atlas data (WHS-SD)
+        run: python scripts/update_rat_data.py --mode ${{ steps.mode.outputs.mode }}
         env:
           PYTHONUNBUFFERED: "1"
 
