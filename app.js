@@ -744,16 +744,22 @@ function onMouseMove(event) {
     // intermediate nodes like "Motor cortex" have 0 direct annotations but
     // non-zero descendant counts, and showing "0 dandisets" there would be
     // misleading. Leaf regions have total == direct so the value is the same.
-    // Matches how the tree badge renders totals via renderBadge.
+    // Matches how the tree badge renders totals via renderBadge. Regions
+    // without a dandiRegions entry fall back to the structure record so they
+    // still get a name/acronym tooltip (with a "no dandisets" footer).
     const region = dandiRegions[String(sid)];
-    if (region) {
-      const dsCount = region.total_dandiset_count ?? region.dandiset_count ?? 0;
-      const fileCount = region.total_file_count ?? region.file_count ?? 0;
+    const structure = idToStructure[sid];
+    const name = region ? region.name : (structure ? structure.name : null);
+    const acronym = region ? region.acronym : (structure ? structure.acronym : '');
+    if (name) {
+      const infoLine = region
+        ? `${region.total_dandiset_count ?? region.dandiset_count ?? 0} dandiset${(region.total_dandiset_count ?? region.dandiset_count ?? 0) !== 1 ? 's' : ''} &middot; ${region.total_file_count ?? region.file_count ?? 0} files`
+        : 'No DANDI datasets reference this region';
       tooltip.classList.remove('hidden');
       tooltip.innerHTML = `
-        <div class="tooltip-name">${region.name}</div>
-        <div class="tooltip-acronym">${region.acronym}</div>
-        <div class="tooltip-info">${dsCount} dandiset${dsCount !== 1 ? 's' : ''} &middot; ${fileCount} files</div>
+        <div class="tooltip-name">${name}</div>
+        <div class="tooltip-acronym">${acronym}</div>
+        <div class="tooltip-info">${infoLine}</div>
       `;
       tooltip.style.left = (event.clientX - renderer.domElement.getBoundingClientRect().left + 15) + 'px';
       tooltip.style.top = (event.clientY - renderer.domElement.getBoundingClientRect().top + 15) + 'px';
@@ -815,10 +821,11 @@ function onClick(event) {
 // Hover includes root when it's the solid init-view mesh, so hovering the
 // whole brain at the atlas view surfaces the aggregate tooltip. Root is
 // excluded while dimmed (fresnel silhouette during selection) — the rim is
-// pure context, not a UI target.
+// pure context, not a UI target. Non-data regions are pickable when visible
+// (e.g. brought in via multi-select) so the user gets a consistent tooltip.
 function getHoverPickables() {
   return Object.values(meshObjects).filter(
-    m => m.visible && (m.userData.isData || (m.userData.isRoot && !m.userData.isDimmed))
+    m => m.visible && (!m.userData.isRoot || !m.userData.isDimmed)
   );
 }
 
@@ -826,7 +833,7 @@ function getHoverPickables() {
 // the hierarchy tree's root node, not the 3D mesh — giving root a click
 // action would create a large accidental-click surface during camera drags.
 function getClickPickables() {
-  return Object.values(meshObjects).filter(m => m.userData.isData && m.visible);
+  return Object.values(meshObjects).filter(m => m.visible && !m.userData.isRoot);
 }
 
 function pickBrainRegionHit(intersects) {
