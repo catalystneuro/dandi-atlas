@@ -1183,11 +1183,10 @@ function updateTreeBadges() {
 async function enterDandisetView(dandisetId, { pushState = true } = {}) {
   return transitionView('dandiset', async () => {
     // Capture prior region(s) so the dandiset panel can offer a back button.
-    // Excludes root (the init view) and empty selection (deep-link entry — no
-    // prior region exists in this session). Stores the full selectedRegionIds
-    // array so multi-region selections survive the round trip back.
-    const rootId = meshManifest ? meshManifest.root_id : null;
-    previousRegionIdsForDandiset = selectedRegionIds.filter(rid => rid !== rootId);
+    // Empty selection (deep-link entry) leaves this empty and suppresses the
+    // button. Root is kept: enterRegionView(rootId) is what renders the
+    // "all dandisets" home view, so going back there is the right behavior.
+    previousRegionIdsForDandiset = selectedRegionIds.slice();
 
     selectedDandiset = dandisetId;
     selectedId = null;
@@ -2223,8 +2222,15 @@ function enterRegionView(structureId, { expandTree = true, pushState = true } = 
 
     if (pushState) setHash(`region=${structureId}`);
 
-    spotlightRegion(structureId);
-    highlightMesh(structureId);
+    // Allen "init" view (root selected) is the colorful whole-brain look —
+    // every loaded mesh visible at its natural opacity. Macaque root and any
+    // non-root region get the normal spotlight (only that region visible).
+    if (newView === 'init' && activeAtlas.coordSystem === 'allen') {
+      showAllRegions();
+    } else {
+      spotlightRegion(structureId);
+      highlightMesh(structureId);
+    }
 
     if (expandTree) expandToNode(structureId);
     // Query after expandToNode so lazily-rendered nodes exist in DOM
