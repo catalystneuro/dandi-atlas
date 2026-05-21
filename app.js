@@ -2618,11 +2618,12 @@ function createTreeNode(node, depth) {
   toggle.className = `tree-toggle ${hasChildren ? '' : 'leaf'}`;
   toggle.textContent = '\u25B6'; // right triangle
 
-  // Multi-select checkbox. Shown only for meaningful selection targets:
-  // a region with data, a 3D mesh, and not the root (root has its own
-  // "everything" semantics via init view).
+  // Multi-select checkbox. Shown for any region that has a 3D mesh and isn't
+  // the root (root has its own "everything" semantics via init view). Regions
+  // without dandiset data are still selectable; their right-panel content just
+  // reports that no dandisets reference them.
   const isRoot = node.id === meshManifest.root_id;
-  const showCheckbox = hasData && hasMesh && !isRoot;
+  const showCheckbox = hasMesh && !isRoot;
   let checkbox = null;
   if (showCheckbox) {
     checkbox = document.createElement('input');
