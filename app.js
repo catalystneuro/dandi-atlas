@@ -2741,17 +2741,20 @@ function createTreeNode(node, depth) {
   el.appendChild(content);
 
   // Children container (lazy: only rendered when expanded)
+  let childrenEl = null;
   if (hasChildren) {
-    const childrenEl = document.createElement('div');
+    childrenEl = document.createElement('div');
     childrenEl.className = 'tree-children';
     childrenEl.dataset.parentId = node.id;
     el.appendChild(childrenEl);
 
-    // Click on toggle or content to expand/collapse
-    content.addEventListener('click', (e) => {
+    // Disclosure triangle: expand/collapse ONLY. Selection and view changes
+    // are intentionally decoupled — clicking the triangle should not pick the
+    // region (so users can browse the hierarchy without disturbing the
+    // current selection or the multi-region checkboxes).
+    toggle.addEventListener('click', (e) => {
       e.stopPropagation();
 
-      // If children not yet rendered, render them
       if (childrenEl.children.length === 0) {
         for (const child of node.children) {
           childrenEl.appendChild(createTreeNode(child, depth + 1));
@@ -2760,32 +2763,23 @@ function createTreeNode(node, depth) {
 
       const isExpanded = childrenEl.classList.toggle('expanded');
       toggle.classList.toggle('expanded', isExpanded);
-
-      // Tree root → full init view, even when a dandiset is selected. Clicking
-      // "everything" should always exit the current scope; otherwise it would
-      // be a dandiset-region filter on root, which is meaningless.
-      if (node.id === meshManifest.root_id) {
-        enterInitView();
-      } else if (selectedDandiset) {
-        filterDandisetPanelByRegion(node.id);
-      } else {
-        enterRegionView(node.id, { expandTree: false });
-      }
-      ensureMeshLoaded(node.id);
-    });
-  } else {
-    content.addEventListener('click', (e) => {
-      e.stopPropagation();
-      if (node.id === meshManifest.root_id) {
-        enterInitView();
-      } else if (selectedDandiset) {
-        filterDandisetPanelByRegion(node.id);
-      } else {
-        enterRegionView(node.id, { expandTree: false });
-      }
-      ensureMeshLoaded(node.id);
     });
   }
+
+  // Row click (label / color dot / badge / empty space): select the region.
+  // Clicks that originate on the toggle triangle or the checkbox are handled
+  // by their own listeners and stop propagation, so they never reach here.
+  content.addEventListener('click', (e) => {
+    e.stopPropagation();
+    if (node.id === meshManifest.root_id) {
+      enterInitView();
+    } else if (selectedDandiset) {
+      filterDandisetPanelByRegion(node.id);
+    } else {
+      enterRegionView(node.id, { expandTree: false });
+    }
+    ensureMeshLoaded(node.id);
+  });
 
   return el;
 }
