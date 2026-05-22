@@ -2747,10 +2747,14 @@ function createTreeNode(node, depth) {
       }
 
       // Region / init / multi-region context: checkbox drives the
-      // selectedRegionIds set directly.
-      const nextIds = checkbox.checked
-        ? [...selectedRegionIds.filter(x => x !== node.id), node.id]
-        : selectedRegionIds.filter(x => x !== node.id);
+      // selectedRegionIds set directly. Root is filtered out: in non-Allen
+      // init view selectedRegionIds = [root] as an internal "everything is
+      // active" marker, but a user-driven selection should never include
+      // root (otherwise root renders 'active' = opaque brain, defeating the
+      // glass-brain context view).
+      const rootId = meshManifest.root_id;
+      const baseIds = selectedRegionIds.filter(x => x !== node.id && x !== rootId);
+      const nextIds = checkbox.checked ? [...baseIds, node.id] : baseIds;
       if (nextIds.length === 0) enterInitView();
       else if (nextIds.length === 1) enterRegionView(nextIds[0], { expandTree: false });
       else enterMultiRegionView(nextIds, { expandTree: false });
